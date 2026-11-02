@@ -3,3 +3,7 @@ __pycache__/
 .env
 config.local.json
 *.pyc
+.tools/
+build/
+dist/
+*.spec

@@ -1,8 +1,105 @@
-# B 站／斗鱼／抖音直播弹幕发送脚本（macOS）
+# B 站／斗鱼／抖音直播弹幕发送脚本（macOS / Windows）
 
-脚本使用 **Edge 中已经打开并登录**的 B 站或斗鱼直播网页，不启动新浏览器，也不要求再次登录。它自动识别当前活动标签页的平台和直播间，切换平台或房间时丢弃旧房间尚未发送的语音。B 站在标签页内请求直播弹幕接口；斗鱼使用页面自己的弹幕发送控件，按 DOM 定位，不依赖屏幕坐标。网页登录凭据只在浏览器标签页内使用，不会写入文件或传回 Python。
+Windows 控制面板使用 **Edge 或 Chrome 中已经打开并登录**的抖音、斗鱼、B 站直播网页，不启动新浏览器，也不要求再次登录。安装项目附带的浏览器连接扩展后，应用能在后台读取所有已打开的直播标签页并向选中的标签页发送弹幕；网页登录凭据只留在浏览器中，不会写入文件。
 
 支持两种内容来源：文本文件逐行发送，或把麦克风语音经阿里云百炼实时识别后自动发送。语音模式仅发送模型判定为**完整句子**的结果。
+
+## 项目目录
+
+```text
+danmushuru/
+├─ danmu.py、windows_app.py、voice.py、windows_*.py  # 程序入口与核心逻辑
+├─ start_gui.bat、start.command、build_windows_exe.bat  # 启动与构建入口
+├─ assets/                   # 窗口背景图片
+├─ web_actions/              # 三个平台的网页操作脚本源文件
+├─ browser_extension_ready/  # 可直接加载到浏览器的扩展
+├─ platforms/                # macOS 与 Windows 客户端辅助代码
+├─ scripts/                  # 扩展构建脚本
+├─ tests/                    # 自动化测试
+└─ dist/                     # 构建出的 Windows exe 与配套文件
+```
+
+`config.local.json` 是本机私有配置；`config.local.example.json` 是可分享的模板。`.venv/` 和 `.tools/` 是本机环境与构建工具目录。
+
+## Windows 网页直播控制面板
+
+### Windows 可执行文件
+
+直接双击 `dist\DanmuLive.exe` 打开控制面板，不需要运行 Python 命令。浏览器连接扩展已经打包进 exe；首次安装时点击窗口中的“安装浏览器扩展”，应用会将扩展放到当前用户的固定目录，并打开浏览器扩展管理页。扩展安装并启用后，面板会自动显示已打开的直播间。
+
+手动弹幕不需要语音配置。点击窗口中的“API 设置”可填写百炼 API Key 和 WebSocket 地址；模型固定为 `paraformer-realtime-v2`。窗口保存的配置位于 `%LOCALAPPDATA%\DanmuLive\config.local.json`，下次开始监听时生效，不会嵌入 exe。首次使用前，exe 仍兼容同目录的 `config.local.json`；运行源码时仍读取项目目录的配置。`config.local.example.json` 保持为空 Key 的模板，也可以使用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_WEBSOCKET_URL` 环境变量覆盖文件中的值。
+
+修改 Python 代码后，可运行 `build_windows_exe.bat` 重新生成 exe。构建需要项目虚拟环境中安装 PyInstaller；构建脚本会把网页脚本和浏览器扩展一起放入 exe。用户配置保存在 exe 外，重新打包不会覆盖窗口中保存的配置。
+
+窗口背景使用 `assets/120131650_p0_master1200.jpg`，构建时一并放入 exe。更换这张图片后，重新运行 `build_windows_exe.bat` 即可更新 exe 背景。
+
+要在**不切换标签页**的情况下识别全部直播页，首次使用时点击窗口中的“安装浏览器扩展”：
+
+1. 在引导窗口点击“打开 Edge 扩展页”或“打开 Chrome 扩展页”。应用会同时打开准备好的扩展目录，也可以点“复制路径”。
+2. 在浏览器扩展管理页开启“开发者模式”，点“加载解压缩的扩展程序”，选择引导窗口显示的目录。如果 Edge 和 Chrome 都在用，分别在两个浏览器里加载一次。浏览器安全机制要求这一步在浏览器内确认，应用不能静默代替安装。
+3. 保持扩展启用。以后只需打开直播网页并启动应用，就会列出所有已打开的抖音、斗鱼、B 站直播标签页，包括后台标签页。扩展与应用只通过本机 `127.0.0.1:8765` 通信。
+
+更新 exe 后，在窗口中再点一次“安装浏览器扩展”以更新固定目录里的文件，并在 Edge 或 Chrome 的扩展管理页点该扩展的“重新加载”。只重启 exe 不会刷新浏览器中已运行的扩展。
+
+选择一个“可发送”的房间，点“开始监听”即可将麦克风识别的完整句子发到所选直播间，点“停止监听”可随时停止；也可以手动发送。扩展在所选标签页的页面内执行发送逻辑，发送前重新核对房间地址，扫描和发送都不切换标签页。应用每 5 秒更新一次房间列表，新开或关闭直播页无需手动刷新。
+
+窗口底部的运行日志按毫秒时间追加显示语音识别的完整句子、排队和准备发送的文本、网页发送结果及失败原因。识别到的句子按顺序发送，默认间隔 1 秒；可在控制台中设为 0 秒，以便上一条发送完成后立即尝试下一条。Windows 控制台的语音断句静音等待为 500 毫秒。直播页暂时不可发送时会保留队列，页面恢复后继续尝试。日志仅保留在当前窗口中，关闭应用后不会写入文件；“网页发送已触发”表示已操作网页发送控件，最终是否展示以直播间为准。
+
+未安装扩展时，面板仍可通过 Windows 辅助功能读取各浏览器窗口的活动标签页；这只能作为有限的兼容方式，不能满足“全部直播页”的要求。网页发送结果中的 `triggered` 表示已触发网页按钮，不能代替直播间实际展示确认。
+
+也可以从项目目录运行：
+
+```powershell
+.\.venv\Scripts\python.exe danmu.py --gui
+```
+
+也可以双击 [start_gui.bat](start_gui.bat)。语音监听需配置百炼 API Key；手动发送和房间扫描不需要。
+
+命令行仍可用 `--browser edge` 或 `--browser chrome` 发送文本；Windows 上会选择扫描到的第一个可发送直播页。需要选择目标时使用控制面板。
+
+## 抖音 Windows 客户端
+
+Windows 客户端适配暂时搁置；项目仍保留 `platforms/windows/douyin_windows.py` 诊断后端。Windows 网页端使用上面的控制面板。macOS 继续使用 `platforms/macos/douyin_ax.swift` 客户端适配。
+
+`--diagnose` 在 Windows 客户端会额外输出 `controlTree` 和当前 UIA 焦点链 `focusedChain`。它只包含控件类型、名称、自动化 ID、类名、ARIA/Legacy 角色、可见/可用/可聚焦状态、可用 Pattern 和文本长度，不输出输入框或草稿的实际内容。抖音有时会把输入框暴露成无名称的非标准控件；当树中只有一个空的可写 `ValuePattern` 控件时，程序会安全地将它作为弹幕输入框；如果输入框当前有焦点，也会沿 UIA 父级链检查其草稿状态，避免误覆盖。发送按钮支持 `InvokePattern` 和 `LegacyIAccessible.DoDefaultAction`，仍不会使用鼠标或键盘模拟。
+
+如果诊断显示 `renderingSurfaceOnly: true`，并且 `nativeChildren` 只有 `Intermediate D3D Window`，说明当前抖音 Windows 客户端没有向外暴露直播文档、输入框或发送按钮的 UI Automation 接口。程序会停止发送，不会把 PowerShell 或其他窗口的 `Edit` 控件误当成弹幕输入框。可以关闭客户端后尝试使用 Chromium 的 `--force-renderer-accessibility` 启动开关重新打开客户端；该开关是否被当前抖音版本保留需要实测，程序不会自动重启或修改客户端进程。
+
+先安装 Python 3.10 或更新版本，再在项目目录运行（PowerShell）：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+本机已创建项目虚拟环境并安装依赖，可以直接测试：
+
+1. 从任务栏或托盘打开抖音主窗口，登录并进入直播间，显示弹幕输入框。隐藏到托盘时无法识别；测试期间不要手动切换焦点或输入草稿。
+2. 运行只读检查，只有“可发送：是”才进行下一步。已识别房间但未匹配到输入框或发送按钮时，诊断会保留房间号；inputCandidates / sendButtonCandidates 列出控件类型、匹配来源、启用状态及内容是否可读，不输出草稿内容：
+
+```powershell
+.\.venv\Scripts\python.exe danmu.py --browser douyin --inspect
+.\.venv\Scripts\python.exe danmu.py --browser douyin --diagnose
+```
+
+3. 试发一条，并在直播间里确认它实际出现：
+
+```powershell
+.\.venv\Scripts\python.exe danmu.py --browser douyin --message "测试弹幕"
+```
+
+4. 单条验收后，可以发送文本文件或接入麦克风：
+
+```powershell
+.\.venv\Scripts\python.exe danmu.py --browser douyin --limit 1 messages.txt
+.\.venv\Scripts\python.exe danmu.py --browser douyin --limit 1
+```
+
+麦克风模式需配置百炼 API Key（见后文）；单条文本和只读诊断不需要。客户端诊断或旧命令行模式请直接运行 `danmu.py --browser douyin --inspect`；Windows 网页端使用前面的控制面板。
+
+输入框已有草稿、直播间身份不明确、多个窗口无法选定、输入或焦点不一致时停止发送。输入框不支持 `ValuePattern`、发送按钮不支持 `InvokePattern` 或按钮不唯一时也会停止，不会退回鼠标或键盘模拟；输入前与调用按钮前重新核对房间和焦点。发送结果只能证明“已调用客户端发送控件”，需要在直播间里实际看到弹幕才能完成验收。客户端未暴露直播文档 URL 时不会把窗口标题或推荐房间链接当作当前房间号。
+
+**验证状态（2026-11-01）**：48 项自动化测试通过，其中包括扩展加载目录不含 Python 缓存的检查。使用临时 Edge 配置实际加载扩展后，静默发现了三个同时打开的直播地址；Chrome 临时无界面加载检查尚未收到扩展快照，Chrome 常规窗口仍需验证。三个平台已登录网页上的弹幕发送与展示也仍需逐一验证。
 
 ## 抖音 Mac 客户端
 
@@ -21,7 +118,7 @@
 
 若 `--inspect` 显示“可发送：否”，输出中的“辅助功能诊断”会列出客户端进程、窗口及直播控件的读取情况；也可以运行 `.venv/bin/python danmu.py --browser douyin --diagnose` 单独查看。诊断只读取控件结构，不发送弹幕。
 
-如果辅助程序不存在或源代码更新，脚本会把项目内的 `douyin_ax.swift` 编译成 `.venv/bin/douyin_ax`，需要 macOS 的 Xcode Command Line Tools。如提示没有辅助功能权限，请到“系统设置 → 隐私与安全性 → 辅助功能”允许当前终端，然后重新运行。脚本通过系统辅助功能读取客户端直播页地址或内嵌直播页面的房间编号，并查找弹幕输入框；发送时暂时聚焦抖音，用真实粘贴和回车操作，随后恢复原先的前台应用。它不会从客户端提取登录凭据，也不需要重新登录。关闭直播间或切换房间时会停止向旧房间发送；客户端彻底退出时会继续监听语音，但跳过没有直播间期间识别的话。
+如果辅助程序不存在或源代码更新，脚本会把项目内的 `platforms/macos/douyin_ax.swift` 编译成 `.venv/bin/douyin_ax`，需要 macOS 的 Xcode Command Line Tools。如提示没有辅助功能权限，请到“系统设置 → 隐私与安全性 → 辅助功能”允许当前终端，然后重新运行。脚本通过系统辅助功能读取客户端直播页地址或内嵌直播页面的房间编号，并查找弹幕输入框；发送时暂时聚焦抖音，用真实粘贴和回车操作，随后恢复原先的前台应用。它不会从客户端提取登录凭据，也不需要重新登录。关闭直播间或切换房间时会停止向旧房间发送；客户端彻底退出时会继续监听语音，但跳过没有直播间期间识别的话。
 
 抖音客户端目前以“已触发发送”报告结果。这个状态表示内容已输入并按下回车，不代表服务器最终展示。若客户端全屏模式移除了弹幕输入框，`--inspect` 会显示“可发送：否”；退出该模式后可继续。已存在的手写草稿会被保留，此时脚本不会发送新语音。
 
@@ -29,7 +126,7 @@
 
 当前版本**没有实现**不依赖输入框的抖音 Mac 客户端发送。抖音开放平台的[直播间评论互动能力](https://developer.open-douyin.com/docs/resource/zh-CN/interaction/jierushuoming/hudongshuju/pinglunshuju/)只提供接收观众评论的能力；[抖音直播 SDK 接入说明](https://developer.open-douyin.com/docs/resource/zh-CN/dop/ability/douyin-live-sdk/douyin-live-sdk/interface-and-function)只向接入方提供 Android SDK，并未公开控制现有 Mac 客户端发送评论的接口。不能把这两种能力当作客户端发送 API。
 
-已获许可对已登录的抖音 Mac 8.7.0 客户端临时使用 Electron 的 `--remote-debugging-port` 启动。参数到达了客户端主进程，但实际没有监听端口，因此只读探针 `douyin_cdp.py` 无法进入当前直播页，也就不能验证客户端自己的发送请求。探针不读取凭据、不发送内容，不属于正式发送链路。调试实例已退出，客户端已恢复普通启动，临时端口已关闭。未经验证的 `webcast/room/chat` 请求不能用“接口返回成功”代替弹幕实际展示。
+已获许可对已登录的抖音 Mac 8.7.0 客户端临时使用 Electron 的 `--remote-debugging-port` 启动。参数到达了客户端主进程，但实际没有监听端口，因此只读探针 `platforms/macos/douyin_cdp.py` 无法进入当前直播页，也就不能验证客户端自己的发送请求。探针不读取凭据、不发送内容，不属于正式发送链路。调试实例已退出，客户端已恢复普通启动，临时端口已关闭。未经验证的 `webcast/room/chat` 请求不能用“接口返回成功”代替弹幕实际展示。
 
 后续在用户重新打开的直播间（`live.douyin.com/990770600117`）确认：客户端仍能识别直播间和输入框，但应用菜单及直播页右键菜单没有开发者入口。只读检查已安装应用的 Electron fuse wire 为 `11100001`；其中第 4 位 `node_cli_inspect=0`。按 [Electron fuse 文档](https://www.electronjs.org/docs/latest/tutorial/fuses)，主进程的 `--inspect` 和 `SIGUSR1` 调试方式会被禁用。没有更改客户端二进制文件或用户配置。
 
@@ -80,7 +177,7 @@ python -m pip install -r requirements.txt
 
 如 PyAudio 安装时报缺少 PortAudio，可先运行 `brew install portaudio`，再重试安装。首次录音时，请允许终端访问麦克风。实时转写使用百炼的 `paraformer-realtime-v2` 模型，接口用法见[阿里云 Python SDK 文档](https://help.aliyun.com/zh/model-studio/paraformer-real-time-speech-recognition-python-sdk)。
 
-打开项目里的 `config.local.json`，在 `dashscope_api_key` 的两个引号之间填入百炼 API Key。`model` 当前为 `paraformer-realtime-v2`。该文件已加入 `.gitignore`，权限设为仅当前用户可读写。
+项目里的 `config.local.json` 已按当前格式填好；如需更换百炼 API Key，修改其中的 `dashscope_api_key`。`model` 当前为 `paraformer-realtime-v2`。该文件已加入 `.gitignore`，权限设为仅当前用户可读写。
 
 默认使用北京地域的 DashScope WebSocket 地址；若你的 Key 属于其他地域，修改配置文件中的 `websocket_url`。也可继续用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_WEBSOCKET_URL` 环境变量覆盖配置文件中的对应值。不要把 Key 写进脚本或 `messages.txt`。
 

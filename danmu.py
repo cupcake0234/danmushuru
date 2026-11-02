@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send text to the live room open in a macOS browser tab."""
+"""Send text to live rooms in macOS browsers or the macOS/Windows Douyin client."""
 
 import argparse
 from collections import deque
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from voice import VoiceError, VoiceStream, list_input_devices
+from windows_browser import BrowserControlError, WindowsBrowser
 
 
 BROWSERS = {
@@ -20,9 +21,10 @@ BROWSERS = {
     "chrome": ("Google Chrome", "/Applications/Google Chrome.app"),
     "safari": ("Safari", "/Applications/Safari.app"),
 }
-SCRIPT_PATH = Path(__file__).with_name("browser_actions.js")
-DOUYU_SCRIPT_PATH = Path(__file__).with_name("douyu_actions.js")
-DOUYIN_SOURCE_PATH = Path(__file__).with_name("douyin_ax.swift")
+PROJECT_ROOT = Path(__file__).resolve().parent
+SCRIPT_PATH = PROJECT_ROOT / "web_actions" / "browser_actions.js"
+DOUYU_SCRIPT_PATH = PROJECT_ROOT / "web_actions" / "douyu_actions.js"
+DOUYIN_SOURCE_PATH = PROJECT_ROOT / "platforms" / "macos" / "douyin_ax.swift"
 DOUYIN_BINARY_PATH = Path(__file__).with_name(".venv") / "bin" / "douyin_ax"
 
 
@@ -42,7 +44,52 @@ class SendStateUnknown(BrowserError):
     pass
 
 
+def run_windows_browser_action(action: str, **kwargs: Any) -> Dict[str, Any]:
+    browser = WindowsBrowser()
+    platform = kwargs.get("expectedPlatform")
+    room_number = kwargs.get("expectedRoom")
+    target = browser.find_target(platform=platform, room_number=room_number)
+    if action == "inspect":
+        if target is None:
+            return {
+                "ok": True, "platform": None, "roomNumber": None, "url": "",
+                "ready": False, "loggedIn": None,
+                "reason": browser.last_error or "未发现支持的网页直播间。",
+            }
+        return target.as_result()
+    if target is None:
+        return {"ok": False, "errorCode": "NO_ROOM", "error": "未发现匹配的网页直播间。"}
+    if action == "send":
+        try:
+            return browser.send(target, kwargs.get("message", ""))
+        except BrowserControlError as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": False, "errorCode": "UNSUPPORTED_ACTION", "error": f"不支持的网页操作：{action}"}
+
+
+def run_douyin_windows_action(action: str, **kwargs: Any) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "platforms" / "windows" / "douyin_windows.py")],
+            input=json.dumps({"action": action, **kwargs}, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BrowserError("Windows 抖音操作失败或超时；请检查输入框和弹幕，不会自动重试。") from exc
+    if result.returncode:
+        raise BrowserError("Windows 抖音辅助程序失败：" + result.stderr[-1000:])
+    try:
+        data = json.loads(result.stdout)
+    except (ValueError, TypeError) as exc:
+        raise BrowserError("无法解析 Windows 抖音辅助程序结果。") from exc
+    if not isinstance(data, dict):
+        raise BrowserError("Windows 抖音辅助程序返回格式不正确。")
+    return data
+
+
 def run_douyin_action(action: str, **kwargs: Any) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        return run_douyin_windows_action(action, **kwargs)
     if not DOUYIN_BINARY_PATH.exists() or (
         DOUYIN_SOURCE_PATH.stat().st_mtime > DOUYIN_BINARY_PATH.stat().st_mtime
     ):
@@ -85,6 +132,10 @@ def run_douyin_action(action: str, **kwargs: Any) -> Dict[str, Any]:
 def run_action(browser: str, action: str, **kwargs: Any) -> Dict[str, Any]:
     if browser == "douyin":
         return run_douyin_action(action, **kwargs)
+    if sys.platform == "win32" and browser in ("edge", "chrome"):
+        return run_windows_browser_action(action, **kwargs)
+    if sys.platform != "darwin":
+        raise BrowserError("网页浏览器发送目前支持带 CDP 端口的 Windows Edge/Chrome 或 macOS 浏览器。")
     payload = json.dumps({"action": action, **kwargs}, ensure_ascii=True)
     javascript = SCRIPT_PATH.read_text(encoding="utf-8").replace("__PAYLOAD_JSON__", payload)
     javascript = " ".join(javascript.splitlines())
@@ -247,7 +298,7 @@ def split_message(text: str, max_chars: int):
 
 def run_microphone(args):
     if not args.transcribe_only:
-        target = "Mac 抖音客户端" if args.browser == "douyin" else BROWSERS[args.browser][0]
+        target = "抖音客户端" if args.browser == "douyin" else BROWSERS[args.browser][0]
         print(f"发送目标：{target}")
     stream = VoiceStream(device_index=args.input_device, silence_ms=args.silence_ms)
     pending = deque()
@@ -348,7 +399,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="持续把麦克风语音发送到浏览器直播间或抖音客户端；也可指定文本文件。")
     parser.add_argument("file", nargs="?", type=Path, help="UTF-8 文本文件，每行一条弹幕")
     parser.add_argument("--browser", choices=[*BROWSERS, "douyin"], default="edge",
-                        help="发送目标；edge/chrome/safari 为网页，douyin 为 Mac 抖音客户端")
+                        help="发送目标；edge/chrome/safari 为网页，douyin 为 macOS/Windows 抖音客户端")
+    parser.add_argument("--message", help="发送一条指定文本；与文本文件和 --mic 互斥")
     parser.add_argument("--interval", type=float, default=20.0, help="两条弹幕之间的秒数，最少 10 秒")
     parser.add_argument("--inspect", action="store_true", help="只检查当前页面、房间号和登录状态，不发送")
     parser.add_argument("--diagnose", action="store_true", help="检查抖音客户端的辅助功能控件结构，不发送")
@@ -359,8 +411,15 @@ def main() -> int:
     parser.add_argument("--input-device", type=int, help="麦克风设备编号；默认优先使用系统输入设备，排除常见回传设备")
     parser.add_argument("--silence-ms", type=int, default=800, help="一句话结束的静音时长，200–6000 毫秒")
     parser.add_argument("--max-chars", type=int, default=20, help="语音弹幕每条最多字符数，默认 20")
+    parser.add_argument("--gui", action="store_true", help="Windows 网页直播控制面板")
     args = parser.parse_args()
-    if args.file is None and not args.inspect and not args.diagnose and not args.list_input_devices:
+    if args.gui:
+        if sys.platform != "win32":
+            parser.error("--gui 仅适用于 Windows")
+        from windows_app import main as windows_main
+        windows_main()
+        return 0
+    if args.file is None and args.message is None and not args.inspect and not args.diagnose and not args.list_input_devices:
         args.mic = True
     if args.diagnose and args.browser != "douyin":
         parser.error("--diagnose 仅适用于 --browser douyin")
@@ -372,8 +431,10 @@ def main() -> int:
         parser.error("--silence-ms 必须在 200 到 6000 之间")
     if not 1 <= args.max_chars <= 80:
         parser.error("--max-chars 必须在 1 到 80 之间")
-    if args.mic and args.file is not None:
-        parser.error("--mic 与文本文件只能选一种")
+    if sum((args.mic, args.file is not None, args.message is not None)) > 1:
+        parser.error("--mic、--message 与文本文件只能选一种")
+    if args.message is not None and (not args.message.strip() or any(ord(c) < 32 for c in args.message)):
+        parser.error("--message 必须是非空的单行文本")
     if args.transcribe_only and not args.mic:
         parser.error("--transcribe-only 不能与文本文件合用")
 
@@ -402,7 +463,7 @@ def main() -> int:
             if not page.get("ok"):
                 raise BrowserError(str(page.get("error", "检查页面失败")))
             if args.browser == "douyin":
-                print("发送目标：抖音 Mac 客户端")
+                print("发送目标：抖音 " + ("Windows" if sys.platform == "win32" else "Mac") + " 客户端")
                 print("客户端内嵌页：" + str(page["url"]))
             else:
                 print("当前页面：" + str(page["url"]))
@@ -412,6 +473,8 @@ def main() -> int:
                 logged_in = page.get("loggedIn")
                 print("检测到登录令牌：" + ("未知" if logged_in is None else "是" if logged_in else "否"))
             print("可发送：" + ("是" if page.get("ready") else "否"))
+            if page.get("reason"):
+                print("原因：" + str(page["reason"]))
             if args.browser == "douyin" and not page.get("ready"):
                 print("辅助功能诊断：" + json.dumps(
                     page.get("diagnostics", []), ensure_ascii=False, separators=(",", ":")
@@ -419,7 +482,7 @@ def main() -> int:
             if args.browser != "douyin":
                 print("网页全屏：" + ("是" if page.get("fullscreen") else "否"))
             return 0
-        messages = read_lines(args.file)
+        messages = [args.message] if args.message is not None else read_lines(args.file)
         if args.limit:
             messages = messages[: args.limit]
         print(f"准备发送 {len(messages)} 条，间隔 {args.interval:g} 秒。按 Ctrl+C 停止。")

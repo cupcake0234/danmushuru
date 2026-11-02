@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "直播弹幕控制台连接器",
+  "version": "0.1.1",
+  "description": "在后台发现已打开的抖音、斗鱼、B站直播页，并连接本机直播弹幕控制台。",
+  "permissions": ["tabs", "scripting", "storage", "alarms"],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "https://live.bilibili.com/*",
+    "https://www.douyu.com/*",
+    "https://douyu.com/*",
+    "https://live.douyin.com/*",
+    "https://www.douyin.com/live/*"
+  ],
+  "background": { "service_worker": "service_worker.js" }
+}

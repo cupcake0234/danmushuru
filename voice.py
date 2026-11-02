@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,8 @@ FRAMES_PER_CHUNK = 1600  # 100 ms of 16-bit mono PCM
 MAX_PENDING_SENTENCES = 50
 DEFAULT_WS_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 DEFAULT_MODEL = "paraformer-realtime-v2"
-CONFIG_PATH = Path(__file__).with_name("config.local.json")
+CONFIG_PATH = (Path(sys.executable) if getattr(sys, "frozen", False)
+               else Path(__file__)).with_name("config.local.json")
 LOOPBACK_NAMES = ("blackhole", "soundflower", "loopback", "virtual audio", "obs virtual")
 
 
@@ -21,27 +23,64 @@ class VoiceError(RuntimeError):
     pass
 
 
-def load_settings():
-    config = {}
-    if CONFIG_PATH.exists():
+def _settings_path():
+    if getattr(sys, "frozen", False):
+        data_home = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        user_path = data_home / "DanmuLive" / CONFIG_PATH.name
+        if user_path.exists():
+            return user_path
+    return CONFIG_PATH
+
+
+def read_settings_file():
+    path = _settings_path()
+    if path.exists():
         try:
-            config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            config = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise VoiceError(f"无法读取 {CONFIG_PATH.name}：{exc}") from exc
+            raise VoiceError(f"无法读取 {path.name}：{exc}") from exc
         if not isinstance(config, dict):
-            raise VoiceError(f"{CONFIG_PATH.name} 的顶层必须是 JSON 对象。")
+            raise VoiceError(f"{path.name} 的顶层必须是 JSON 对象。")
+        return config
+    return {}
+
+
+def save_settings(api_key, websocket_url):
+    api_key = api_key.strip()
+    websocket_url = websocket_url.strip()
+    if not api_key:
+        raise VoiceError("请填写百炼 API Key。")
+    if not websocket_url.startswith("wss://"):
+        raise VoiceError("WebSocket 地址必须以 wss:// 开头。")
+    path = _settings_path()
+    if getattr(sys, "frozen", False):
+        path = (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+                / "DanmuLive" / CONFIG_PATH.name)
+    config = {"dashscope_api_key": api_key, "model": DEFAULT_MODEL,
+              "websocket_url": websocket_url}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise VoiceError(f"无法保存 {path.name}：{exc}") from exc
+    return path
+
+
+def load_settings():
+    config = read_settings_file()
+    path = _settings_path()
 
     key = os.environ.get("DASHSCOPE_API_KEY") or config.get("dashscope_api_key", "")
     if not isinstance(key, str) or not key.strip():
-        raise VoiceError("请在 config.local.json 的 dashscope_api_key 中填写百炼 API Key。")
+        raise VoiceError(f"请在 {path} 的 dashscope_api_key 中填写百炼 API Key。")
     model = config.get("model", DEFAULT_MODEL)
     if model != DEFAULT_MODEL:
-        raise VoiceError(f"当前仅支持 {DEFAULT_MODEL}，请检查 config.local.json 的 model。")
+        raise VoiceError(f"当前仅支持 {DEFAULT_MODEL}，请检查 {path} 的 model。")
     websocket_url = os.environ.get("DASHSCOPE_WEBSOCKET_URL") or config.get(
         "websocket_url", DEFAULT_WS_URL
     )
     if not isinstance(websocket_url, str) or not websocket_url.startswith("wss://"):
-        raise VoiceError("config.local.json 的 websocket_url 必须是 wss:// 地址。")
+        raise VoiceError(f"{path} 的 websocket_url 必须是 wss:// 地址。")
     return key.strip(), model, websocket_url
 
 

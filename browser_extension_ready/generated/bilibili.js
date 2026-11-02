@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const request = __PAYLOAD_JSON__;
+  const request = globalThis.__danmuPayload;
   const data = { ok: false, url: location.href, fullscreen: Boolean(document.fullscreenElement) };
   const finish = () => JSON.stringify(data);
   const onLiveSite = location.hostname === "live.bilibili.com";
@@ -28,11 +28,6 @@
     data.error = "当前活动标签页已切换直播间。";
     return finish();
   }
-  if (!roomNumber || !csrf) {
-    data.errorCode = "NO_ROOM";
-    data.error = "缺少直播房间号或登录令牌；请确认浏览器里已经登录 B 站。";
-    return finish();
-  }
   if (request.action === "poll") {
     const job = getJob();
     if (!job || job.id !== request.jobId) {
@@ -50,6 +45,11 @@
     } else {
       data.ok = true;
     }
+    return finish();
+  }
+  if (!roomNumber || !csrf) {
+    data.errorCode = "NO_ROOM";
+    data.error = "缺少直播房间号或登录令牌；请确认浏览器里已经登录 B 站。";
     return finish();
   }
   if (request.action !== "send" || typeof request.message !== "string" ||

@@ -1,16 +1,36 @@
 (function () {
   "use strict";
-  const request = __PAYLOAD_JSON__;
+  const request = globalThis.__danmuPayload;
   const data = { ok: false, url: location.href, fullscreen: Boolean(document.fullscreenElement) };
   const finish = () => JSON.stringify(data);
-  const onDouyu = location.hostname === "www.douyu.com";
+  const onDouyu = location.hostname === "www.douyu.com" || location.hostname === "douyu.com";
   const match = onDouyu && location.pathname.match(/^\/([A-Za-z0-9_-]+)(?:\/|$)/);
   const roomNumber = match ? match[1] : null;
   const loggedIn = onDouyu && /(?:^|;\s*)acf_uid=\d+(?:;|$)/.test(document.cookie);
-  const findControls = () => ({
-    input: document.querySelector("textarea.ChatSend-txt, div.ChatSend-txt"),
-    button: document.querySelector(".ChatSend-button")
-  });
+  const visible = node => {
+    if (!node || node.disabled || node.readOnly) return false;
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const findControls = () => {
+    const inputs = Array.from(document.querySelectorAll(
+      "textarea.ChatSend-txt, div.ChatSend-txt, textarea[placeholder*='弹幕'], " +
+      "[contenteditable='true'][class*='Chat'], [role='textbox']"
+    )).filter(visible);
+    const input = inputs.sort((left, right) => {
+      const score = node => /ChatSend|弹幕|评论|聊天/i.test(
+        [node.className, node.getAttribute("placeholder"), node.getAttribute("aria-label")].filter(Boolean).join(" ")
+      ) ? 1 : 0;
+      return score(right) - score(left);
+    })[0] || null;
+    const buttons = Array.from(document.querySelectorAll(
+      ".ChatSend-button, [class*='ChatSend'] button, button[aria-label*='发送'], " +
+      "button[data-e2e*='send'], [role='button'][aria-label*='发送']"
+    )).filter(visible);
+    const button = buttons.find(node => !node.disabled && !node.classList.contains("is-gray")) || buttons[0] || null;
+    return { input, button };
+  };
   const controls = findControls();
   const jobKey = "__danmuSenderDouyuJob";
   const getJob = () => {
@@ -23,18 +43,13 @@
     data.ok = true;
     data.platform = "douyu";
     data.roomNumber = controls.input && controls.button ? roomNumber : null;
-    data.loggedIn = Boolean(loggedIn);
-    data.ready = Boolean(roomNumber && loggedIn && controls.input && controls.button);
+    data.loggedIn = loggedIn ? true : (controls.input && controls.button ? null : false);
+    data.ready = Boolean(roomNumber && controls.input && controls.button);
     return finish();
   }
   if (request.expectedRoom && roomNumber !== request.expectedRoom) {
     data.errorCode = "ROOM_CHANGED";
     data.error = "当前活动标签页已切换直播间。";
-    return finish();
-  }
-  if (!roomNumber || !loggedIn || !controls.input || !controls.button) {
-    data.errorCode = "NO_ROOM";
-    data.error = "斗鱼直播间未登录或弹幕控件尚未加载。";
     return finish();
   }
   if (request.action === "poll") {
@@ -53,6 +68,11 @@
       if (job.confirmation) data.confirmation = job.confirmation;
       sessionStorage.removeItem(jobKey);
     }
+    return finish();
+  }
+  if (!roomNumber || !controls.input || !controls.button) {
+    data.errorCode = "NO_ROOM";
+    data.error = "斗鱼直播间未登录或弹幕控件尚未加载。";
     return finish();
   }
   if (request.action !== "send" || typeof request.message !== "string" ||
@@ -83,8 +103,9 @@
         input.innerText = request.message;
       }
       input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise(resolve => setTimeout(resolve, 100));
-      const currentMatch = location.hostname === "www.douyu.com" &&
+      const currentMatch = (location.hostname === "www.douyu.com" || location.hostname === "douyu.com") &&
         location.pathname.match(/^\/([A-Za-z0-9_-]+)(?:\/|$)/);
       if (!currentMatch || currentMatch[1] !== roomNumber || !input.isConnected || !button.isConnected) {
         job.errorCode = "ROOM_CHANGED";
@@ -105,6 +126,7 @@
         if (input.tagName === "TEXTAREA") input.value = "";
         else input.innerText = "";
         input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
       }
     } finally {
       job.state = "done";
