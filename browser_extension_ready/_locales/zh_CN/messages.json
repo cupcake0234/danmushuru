@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "直播弹幕控制台连接器",
+    "description": "扩展名称"
+  },
+  "extensionDescription": {
+    "message": "连接本机直播弹幕控制台，发现已打开的抖音、斗鱼、B站直播页，支持活动直播间跟随和弹幕发送。",
+    "description": "扩展的简短说明"
+  }
+}

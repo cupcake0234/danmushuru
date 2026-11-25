@@ -9,16 +9,23 @@ const SCRIPTS = {
 const tabLocks = new Map();
 const inspected = new Map();
 let clientId = null;
+let identityTask = null;
 let nextSnapshot = 0;
 let polling = false;
 let hasSnapshot = false;
+let lastActiveAt = 0;
+let viewingTask = null;
 
 async function identity() {
   if (clientId) return clientId;
-  const saved = await chrome.storage.local.get("clientId");
-  clientId = saved.clientId || crypto.randomUUID();
-  if (!saved.clientId) await chrome.storage.local.set({ clientId });
-  return clientId;
+  if (!identityTask) identityTask = (async () => {
+    const saved = await chrome.storage.local.get(["clientId", "lastActiveAt"]);
+    clientId = saved.clientId || crypto.randomUUID();
+    lastActiveAt = Number(saved.lastActiveAt) || 0;
+    if (!saved.clientId) await chrome.storage.local.set({ clientId });
+    return clientId;
+  })();
+  return identityTask;
 }
 
 function platformAndRoom(url) {
@@ -48,6 +55,33 @@ async function request(path, method = "GET", body) {
   });
   if (!response.ok) throw new Error("本机连接失败：HTTP " + response.status);
   return response.json();
+}
+
+// Report the last used normal browser window, even while the control panel is in front.
+// A non-live active tab is reported with an empty URL; unrelated browsing stays in the browser.
+async function publishViewing() {
+  const id = await identity();
+  let tab = null;
+  try {
+    const window = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (window.state !== "minimized") {
+      [tab] = await chrome.tabs.query({ active: true, windowId: window.id });
+      if (window.focused) {
+        lastActiveAt = Date.now();
+        await chrome.storage.local.set({ lastActiveAt });
+      }
+    }
+  } catch (_) {}
+  const live = tab && platformAndRoom(tab.pendingUrl || tab.url || "");
+  return request("/view", "POST", {
+    clientId: id, tabId: tab?.id ?? -1, lastActiveAt,
+    url: live ? (tab.pendingUrl || tab.url) : "", title: live ? (tab.title || "") : ""
+  });
+}
+
+function reportViewing() {
+  if (!viewingTask) viewingTask = publishViewing().catch(() => null).finally(() => { viewingTask = null; });
+  return viewingTask;
 }
 
 async function runScript(tabId, platform, payload) {
@@ -109,6 +143,12 @@ async function execute(command) {
     const tab = await chrome.tabs.get(command.tabId);
     const identity = platformAndRoom(tab.url || "");
     const expected = command.payload || {};
+    if (expected.followActive && command.action === "send") {
+      const view = (await reportViewing())?.current;
+      if (!view || view.clientId !== clientId || view.tabId !== tab.id || view.url !== tab.url) {
+        throw new Error("自动跟随的活动直播页已变化，未发送");
+      }
+    }
     if (!identity || (expected.expectedPlatform && identity[0] !== expected.expectedPlatform) ||
         (expected.expectedRoom && identity[1] !== expected.expectedRoom)) {
       throw new Error("直播标签页已切换房间，未发送");
@@ -147,6 +187,7 @@ async function poll() {
 function start() {
   chrome.alarms.create("bridge", { periodInMinutes: 0.5 });
   poll();
+  reportViewing();
 }
 
 chrome.runtime.onStartup.addListener(start);
@@ -155,7 +196,11 @@ chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "bridge") poll()
 chrome.tabs.onCreated.addListener(() => { nextSnapshot = 0; poll(); });
 chrome.tabs.onRemoved.addListener(() => { nextSnapshot = 0; poll(); });
 chrome.tabs.onUpdated.addListener((_tabId, change) => {
-  if (change.url || change.status === "complete") { nextSnapshot = 0; poll(); }
+  if (change.url || change.status === "complete") { nextSnapshot = 0; poll(); reportViewing(); }
 });
+chrome.tabs.onActivated.addListener(() => { nextSnapshot = 0; reportViewing(); poll(); });
+chrome.windows.onFocusChanged.addListener(() => { reportViewing(); });
+chrome.windows.onRemoved.addListener(() => { reportViewing(); });
 setInterval(poll, 1000);
+setInterval(reportViewing, 1000);
 start();

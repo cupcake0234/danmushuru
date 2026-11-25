@@ -6,12 +6,12 @@ from collections import deque
 import json
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict
 
+from project_paths import project_root
 from voice import VoiceError, VoiceStream, list_input_devices
 from windows_browser import BrowserControlError, WindowsBrowser
 
@@ -95,8 +95,8 @@ def run_douyin_action(action: str, **kwargs: Any) -> Dict[str, Any]:
     ):
         print("正在编译抖音客户端辅助程序（首次运行可能需要约一分钟）……", file=sys.stderr)
         DOUYIN_BINARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        cache = Path(tempfile.gettempdir()) / "danmushuru-swift-cache"
-        cache.mkdir(exist_ok=True)
+        cache = project_root() / ".tools" / "cache" / "swift"
+        cache.mkdir(parents=True, exist_ok=True)
         import os
         environment = os.environ.copy()
         environment["CLANG_MODULE_CACHE_PATH"] = str(cache / "clang")
@@ -300,7 +300,8 @@ def run_microphone(args):
     if not args.transcribe_only:
         target = "抖音客户端" if args.browser == "douyin" else BROWSERS[args.browser][0]
         print(f"发送目标：{target}")
-    stream = VoiceStream(device_index=args.input_device, silence_ms=args.silence_ms)
+    stream = VoiceStream(device_index=args.input_device, silence_ms=args.silence_ms,
+                         provider=args.voice_provider, model_dir=args.local_model_dir)
     pending = deque()
     last_sent = None
     sent_count = 0
@@ -409,6 +410,9 @@ def main() -> int:
     parser.add_argument("--transcribe-only", action="store_true", help="麦克风模式只显示识别文本，不发送")
     parser.add_argument("--list-input-devices", action="store_true", help="列出可用麦克风设备")
     parser.add_argument("--input-device", type=int, help="麦克风设备编号；默认优先使用系统输入设备，排除常见回传设备")
+    parser.add_argument("--voice-provider", choices=("dashscope", "sensevoice"),
+                        help="语音引擎：dashscope 百炼云端，sensevoice 本地离线；默认读取配置")
+    parser.add_argument("--local-model-dir", help="本地 SenseVoice 模型目录，包含 model.int8.onnx 和 tokens.txt")
     parser.add_argument("--silence-ms", type=int, default=800, help="一句话结束的静音时长，200–6000 毫秒")
     parser.add_argument("--max-chars", type=int, default=20, help="语音弹幕每条最多字符数，默认 20")
     parser.add_argument("--gui", action="store_true", help="Windows 网页直播控制面板")

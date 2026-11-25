@@ -2,8 +2,10 @@
 __pycache__/
 .env
 config.local.json
+data/
 *.pyc
 .tools/
 build/
 dist/
+release/
 *.spec

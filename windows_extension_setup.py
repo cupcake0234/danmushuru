@@ -6,10 +6,14 @@ import shutil
 import subprocess
 import sys
 
+from project_paths import data_dir
+
 
 EXTENSION_FILES = (
     "manifest.json", "service_worker.js", "generated/bilibili.js",
     "generated/douyu.js", "generated/douyin.js",
+    "_locales/zh_CN/messages.json", "icons/icon16.png", "icons/icon32.png",
+    "icons/icon48.png", "icons/icon128.png",
 )
 BROWSERS = {
     "edge": ("msedge.exe", "edge://extensions"),
@@ -23,8 +27,7 @@ def extension_source():
 
 
 def extension_folder():
-    data_home = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    return data_home / "DanmuLive" / "browser_extension_ready"
+    return data_dir() / "browser_extension_ready"
 
 
 def prepare_extension(source=None, destination=None):

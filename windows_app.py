@@ -10,17 +10,17 @@ import time
 import tkinter as tk
 from collections import deque
 from datetime import datetime
-from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
-from voice import (DEFAULT_MODEL, DEFAULT_WS_URL, VoiceError, VoiceStream,
-                   read_settings_file, save_settings)
+from model_store import (MODEL_BYTES, ModelInstallCancelled, install_model,
+                         managed_model_dir)
+from voice import (DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_WS_URL, VoiceError, VoiceStream,
+                   default_local_model_dir, read_settings_file, save_settings)
 from windows_browser import WindowsBrowser
+from windows_theme import ActivityLog, ModeButton, PhotoButton, PhotoLabel, RoomTable
 
 MAX_VOICE_QUEUE = 100
 MISSING_TARGET_GRACE_SECONDS = 30
-BACKGROUND_IMAGE = (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-                    / "assets" / "120131650_p0_master1200.jpg")
 
 
 class WindowsControlPanel:
@@ -51,94 +51,95 @@ class WindowsControlPanel:
         self.voice_send_timer = None
         self.voice_waiting_for_room = False
         self.voice_inflight = None
+        self.auto_listen_requested = False
+        self.auto_follow_busy = False
+        self.auto_follow_generation = 0
+        self.auto_target_identity = None
+        self.auto_hint = "等待浏览器活动直播页。"
         self.jobs = queue.Queue()
         self.last_scan_notice = None
         self._build()
-        self._draw_background(width, height)
-        self.root.after(150, self._make_controls_translucent)
         self.root.after(100, self._drain_jobs)
         self.root.after(200, self.refresh_rooms)
         self.root.after(5000, self._refresh_timer)
+        self.root.after(500, self._auto_follow_timer)
 
     def _build(self):
         colors = {
-            "background": "#F3F6FA", "surface": "#FFFFFF", "text": "#17243A",
-            "muted": "#66758C", "border": "#DFE6EF", "accent": "#2864DC",
-            "accent_hover": "#1E55C2", "success": "#18835A", "error": "#BF4242",
+            "background": "#F5F7FA", "surface": "#FFFFFF", "text": "#263241",
+            "muted": "#687586", "border": "#E4E8EF", "accent": "#3B74CD",
+            "accent_hover": "#2F63B3", "success": "#347A61", "error": "#B24C5D",
         }
         self.root.configure(bg=colors["background"])
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("App.Treeview", background=colors["surface"], fieldbackground=colors["surface"],
-                        foreground=colors["text"], rowheight=30, borderwidth=0,
-                        font=("Microsoft YaHei UI", 9))
-        style.configure("App.Treeview.Heading", background="#F7F9FC", foreground=colors["muted"],
-                        relief="flat", padding=(8, 9), font=("Microsoft YaHei UI", 9, "bold"))
-        style.map("App.Treeview", background=[("selected", "#E4EEFF")],
-                  foreground=[("selected", colors["text"])])
-        style.map("App.Treeview.Heading", background=[("active", "#F0F4FA")])
-        style.configure("App.TButton", padding=(12, 7), font=("Microsoft YaHei UI", 9))
-        style.configure("App.TEntry", padding=7)
+        style.configure(".", background=colors["surface"], foreground=colors["text"],
+                        font=("Microsoft YaHei UI", 9), borderwidth=0)
+        style.configure("TButton", background="#F0F3F7", foreground=colors["text"],
+                        borderwidth=0, focusthickness=0, padding=(12, 7))
+        style.map("TButton", background=[("pressed", "#DCE7F7"), ("active", "#E6EDF7")],
+                  foreground=[("disabled", "#9AA3AF")])
+        style.configure("TEntry", fieldbackground="#FFFFFF", foreground=colors["text"],
+                        insertcolor=colors["text"], bordercolor=colors["border"],
+                        lightcolor="#FFFFFF", darkcolor="#FFFFFF", borderwidth=1,
+                        relief="flat", padding=(6, 4))
+        style.map("TEntry", bordercolor=[("focus", "#91B1E0")],
+                  fieldbackground=[("readonly", "#F5F7FA")])
+        style.configure("TCombobox", fieldbackground="#FFFFFF", background="#F5F7FA",
+                        foreground=colors["text"], arrowcolor=colors["muted"], borderwidth=1,
+                        bordercolor=colors["border"], lightcolor="#FFFFFF", darkcolor="#FFFFFF", padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", "#FFFFFF")],
+                  foreground=[("readonly", colors["text"])], selectbackground=[("readonly", "#FFFFFF")])
+        style.configure("TSpinbox", fieldbackground="#FFFFFF", foreground=colors["text"],
+                        background="#F5F7FA", arrowcolor=colors["muted"], borderwidth=1,
+                        bordercolor=colors["border"], lightcolor="#FFFFFF", darkcolor="#FFFFFF", padding=4)
+        style.configure("TCheckbutton", background=colors["surface"], foreground=colors["muted"])
+        style.map("TCheckbutton", background=[("active", colors["surface"])])
+        style.configure("Horizontal.TProgressbar", background="#79A0DC", troughcolor="#EEF2F7",
+                        borderwidth=0, lightcolor="#79A0DC", darkcolor="#79A0DC")
+        self.root.option_add("*TCombobox*Listbox.background", "#FFFFFF")
+        self.root.option_add("*TCombobox*Listbox.foreground", colors["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", "#E5EFFD")
 
-        try:
-            from PIL import Image
-            self.background_source = Image.open(BACKGROUND_IMAGE).convert("RGB")
-        except (ImportError, OSError):
-            self.background_source = None
-        self.background_photo = None
-        self.background_size = None
-        self.background_job = None
-        self.photo_surfaces = []
-        self.surface_photos = {}
-        shell = tk.Frame(self.root, bg=colors["background"], bd=0, padx=20, pady=18)
-        self.background_panel = shell
+        shell = tk.Frame(self.root, bg=colors["background"], bd=0, padx=10, pady=10)
+        self.main_panel = shell
         shell.pack(fill="both", expand=True)
-        self.background_layer = tk.Label(shell, borderwidth=0)
-        self.background_layer.place(x=0, y=0, relwidth=1, relheight=1)
-        self.background_layer.lower()
         shell.grid_columnconfigure(0, weight=1)
         shell.grid_rowconfigure(1, weight=2)
         shell.grid_rowconfigure(3, weight=2)
-        if self.background_source:
-            shell.bind("<Configure>", self._schedule_background_resize)
 
         header = tk.Frame(shell, bg=colors["background"])
-        self._add_photo_surface(header)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 15))
-        tk.Label(header, text="直播弹幕控制台", bg=colors["background"], fg=colors["text"],
+        PhotoLabel(header, text="直播弹幕控制台", fg=colors["text"],
                  font=("Microsoft YaHei UI", 18, "bold")).pack(side="left")
-        tk.Label(header, text="WINDOWS · 网页直播", bg=colors["background"], fg=colors["muted"],
+        PhotoLabel(header, text="LIVE / 语音与弹幕", fg=colors["muted"],
                  font=("Segoe UI", 9)).pack(side="left", padx=(14, 0), pady=(7, 0))
-        self.status = tk.Label(header, text="正在扫描浏览器…", bg="#EAF1FF", fg=colors["accent"],
+        self.status = PhotoLabel(header, text="正在扫描浏览器…", fg=colors["accent"],
                                padx=12, pady=7, font=("Microsoft YaHei UI", 9))
         self.status.pack(side="right")
-        ttk.Button(header, text="安装浏览器扩展", command=self.show_extension_setup,
-                   style="App.TButton").pack(side="right", padx=(0, 8))
-        ttk.Button(header, text="API 设置", command=self.show_api_settings,
-                   style="App.TButton").pack(side="right", padx=(0, 8))
+        PhotoButton(header, text="浏览器扩展", command=self.show_extension_setup).pack(
+            side="right", padx=(0, 8))
+        PhotoButton(header, text="语音设置", command=self.show_api_settings).pack(
+            side="right", padx=(0, 8))
 
-        rooms_card = tk.Frame(shell, bg=colors["surface"], highlightbackground=colors["border"],
-                              highlightthickness=1)
-        self._add_photo_surface(rooms_card)
+        rooms_card = tk.Frame(shell, bg=colors["surface"], bd=0, highlightthickness=0)
         rooms_card.grid(row=1, column=0, sticky="nsew")
         rooms_card.grid_columnconfigure(0, weight=1)
         rooms_card.grid_rowconfigure(1, weight=1)
-        rooms_header = tk.Frame(rooms_card, bg=colors["surface"], padx=16, pady=13)
-        self._add_photo_surface(rooms_header)
+        rooms_header = tk.Frame(rooms_card, bg=colors["surface"], padx=10, pady=10)
         rooms_header.grid(row=0, column=0, sticky="ew")
-        tk.Label(rooms_header, text="已打开的直播间", bg=colors["surface"], fg=colors["text"],
+        PhotoLabel(rooms_header, text="直播间", fg=colors["text"],
                  font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        tk.Label(rooms_header, text="自动发现浏览器中的直播页面", bg=colors["surface"],
-                 fg=colors["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 0))
-        ttk.Button(rooms_header, text="刷新房间", command=self.refresh_rooms,
-                   style="App.TButton").pack(side="right")
+        self.target_mode = tk.StringVar(value="manual")
+        for value, label in (("manual", "手动选择"), ("auto", "自动跟随")):
+            ModeButton(rooms_header, text=label, variable=self.target_mode, value=value,
+                       command=self._change_target_mode, padx=14, pady=6).pack(side="left", padx=(8, 0))
+        PhotoButton(rooms_header, text="刷新房间", command=self.refresh_rooms, pady=6).pack(side="right")
 
-        table_frame = tk.Frame(rooms_card, bg=colors["surface"], padx=12, pady=0)
-        self._add_photo_surface(table_frame)
+        table_frame = tk.Frame(rooms_card, bg=colors["surface"], padx=5, pady=0)
         table_frame.grid(row=1, column=0, sticky="nsew")
         columns = ("platform", "room", "title", "ready", "url")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse",
-                                  height=5, style="App.Treeview")
+        self.table = RoomTable(table_frame, columns=columns, height=5)
         headings = {"platform": "平台", "room": "房间", "title": "页面标题", "ready": "状态", "url": "地址"}
         widths = {"platform": 80, "room": 110, "title": 260, "ready": 105, "url": 340}
         for column in columns:
@@ -146,41 +147,37 @@ class WindowsControlPanel:
             self.table.column(column, width=widths[column], anchor="w", minwidth=70,
                               stretch=column in ("title", "url"))
         self.table.bind("<<TreeviewSelect>>", self._select_room)
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        self.table.configure(yscrollcommand=scrollbar.set)
-        self.table.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        tk.Frame(rooms_card, bg=colors["surface"], height=10).grid(row=2, column=0)
+        self.table.bind("<ButtonRelease-1>", self._manual_room_choice, add="+")
+        for key in ("Up", "Down", "Home", "End", "Prior", "Next", "space"):
+            self.table.bind(f"<KeyRelease-{key}>", self._manual_room_choice, add="+")
+        self.table.pack(fill="both", expand=True)
 
-        action_card = tk.Frame(shell, bg=colors["surface"], highlightbackground=colors["border"],
-                               highlightthickness=1, padx=16, pady=14)
-        self._add_photo_surface(action_card)
-        action_card.grid(row=2, column=0, sticky="ew", pady=12)
+        action_card = tk.Frame(shell, bg=colors["surface"], bd=0, highlightthickness=0,
+                               padx=10, pady=10)
+        action_card.grid(row=2, column=0, sticky="ew", pady=8)
         action_card.grid_columnconfigure(0, weight=1)
         selected_row = tk.Frame(action_card, bg=colors["surface"])
-        self._add_photo_surface(selected_row)
         selected_row.grid(row=0, column=0, sticky="ew")
-        self.selected_room_label = tk.Label(selected_row, text="尚未选择直播间", bg=colors["surface"],
+        self.selected_room_label = PhotoLabel(selected_row, text="尚未选择直播间",
                                             fg=colors["text"], font=("Microsoft YaHei UI", 11, "bold"))
         self.selected_room_label.pack(side="left")
-        self.listen_indicator = tk.Label(selected_row, text="未监听", bg="#F0F3F7", fg=colors["muted"],
+        self.listen_indicator = PhotoLabel(selected_row, text="未监听", fg=colors["muted"],
                                           padx=10, pady=4, font=("Microsoft YaHei UI", 9))
         self.listen_indicator.pack(side="right")
-        self.selected_room_hint = tk.Label(action_card, text="从上方列表中选择一个可发送的直播间",
-                                            bg=colors["surface"], fg=colors["muted"],
+        self.selected_room_hint = PhotoLabel(action_card, text="从上方列表中选择一个可发送的直播间",
+                                            fg=colors["muted"],
                                             font=("Microsoft YaHei UI", 9), anchor="w")
         self.selected_room_hint.grid(row=1, column=0, sticky="ew", pady=(3, 13))
 
         controls = tk.Frame(action_card, bg=colors["surface"])
-        self._add_photo_surface(controls)
         controls.grid(row=2, column=0, sticky="ew")
-        tk.Label(controls, text="发送间隔（秒）", bg=colors["surface"], fg=colors["muted"],
+        PhotoLabel(controls, text="发送间隔（秒）", fg=colors["muted"],
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.interval_var = tk.StringVar(value="1")
         ttk.Entry(controls, textvariable=self.interval_var, width=7,
                   style="App.TEntry").pack(side="left", padx=(8, 0))
-        self.listen_button = tk.Button(controls, text="开始监听", command=self.toggle_listening,
-                                       state="disabled", bg=colors["accent"], fg="white",
+        self.listen_button = PhotoButton(controls, text="开始监听", command=self.toggle_listening,
+                                       variant="primary", state="disabled", bg=colors["accent"], fg="white",
                                        activebackground=colors["accent_hover"], activeforeground="white",
                                        disabledforeground="#DCE7FB", relief="flat", bd=0,
                                        padx=24, pady=9, cursor="hand2",
@@ -188,121 +185,45 @@ class WindowsControlPanel:
         self.listen_button.pack(side="right")
 
         message_row = tk.Frame(action_card, bg=colors["surface"])
-        self._add_photo_surface(message_row)
         message_row.grid(row=3, column=0, sticky="ew", pady=(15, 0))
-        tk.Label(message_row, text="手动弹幕", bg=colors["surface"], fg=colors["muted"],
+        PhotoLabel(message_row, text="手动弹幕", fg=colors["muted"],
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.message_var = tk.StringVar()
         message_entry = ttk.Entry(message_row, textvariable=self.message_var, style="App.TEntry")
         message_entry.pack(side="left", fill="x", expand=True, padx=(15, 9))
         message_entry.bind("<Return>", lambda _: self.send_message())
-        self.send_button = ttk.Button(message_row, text="发送弹幕", command=self.send_message,
-                                      style="App.TButton")
+        self.send_button = PhotoButton(message_row, text="发送弹幕", command=self.send_message)
         self.send_button.pack(side="right")
-        log_card = tk.Frame(shell, bg=colors["surface"], highlightbackground=colors["border"],
-                            highlightthickness=1)
-        self._add_photo_surface(log_card)
+        log_card = tk.Frame(shell, bg=colors["surface"], bd=0, highlightthickness=0)
         log_card.grid(row=3, column=0, sticky="nsew")
         log_card.grid_columnconfigure(0, weight=1)
         log_card.grid_rowconfigure(1, weight=1)
-        log_header = tk.Frame(log_card, bg=colors["surface"], padx=16, pady=11)
-        self._add_photo_surface(log_header)
+        log_header = tk.Frame(log_card, bg=colors["surface"], padx=10, pady=8)
         log_header.grid(row=0, column=0, sticky="ew")
-        tk.Label(log_header, text="运行日志", bg=colors["surface"], fg=colors["text"],
+        PhotoLabel(log_header, text="运行日志", fg=colors["text"],
                  font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        tk.Label(log_header, text="识别内容与发送结果实时显示", bg=colors["surface"],
+        PhotoLabel(log_header, text="识别内容与发送结果实时显示",
                  fg=colors["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 0))
-        log_frame = tk.Frame(log_card, bg=colors["surface"], padx=12, pady=0)
-        self._add_photo_surface(log_frame)
+        PhotoButton(log_header, text="复制日志", command=lambda: self.detail.copy_all(),
+                    pady=4, padx=12).pack(side="right")
+        log_frame = tk.Frame(log_card, bg=colors["surface"], padx=5, pady=0)
         log_frame.grid(row=1, column=0, sticky="nsew")
-        self.detail = tk.Text(log_frame, height=8, state="disabled", wrap="word", relief="flat",
-                              bg="#F8FAFD", fg=colors["text"], selectbackground="#DCE9FF",
-                              padx=10, pady=8, spacing1=3, spacing3=3,
-                              font=("Consolas", 9))
-        self.detail.tag_configure("success", foreground=colors["success"])
-        self.detail.tag_configure("error", foreground=colors["error"])
-        self.detail.tag_configure("recognized", foreground=colors["accent"])
-        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.detail.yview)
-        self.detail.configure(yscrollcommand=log_scrollbar.set)
-        self.detail.pack(side="left", fill="both", expand=True)
-        log_scrollbar.pack(side="right", fill="y")
-        tk.Frame(log_card, bg=colors["surface"], height=10).grid(row=2, column=0)
+        self.detail = ActivityLog(log_frame)
+        self.detail.pack(fill="both", expand=True)
+
+        self.root.bind("<Destroy>", self._window_destroyed, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-    def _add_photo_surface(self, frame):
-        if self.background_source is None:
-            return
-        background = tk.Label(frame, borderwidth=0)
-        background.place(x=0, y=0, relwidth=1, relheight=1)
-        background.lower()
-        self.photo_surfaces.append((frame, background))
-        frame.bind("<Configure>", self._schedule_background_resize)
-
-    def _schedule_background_resize(self, event):
-        if self.background_job is not None:
-            self.root.after_cancel(self.background_job)
-        self.background_job = self.root.after(80, self._draw_background)
-
-    def _draw_background(self, width=None, height=None):
-        self.background_job = None
-        if self.background_source is None:
-            return
-        width = width or self.background_panel.winfo_width()
-        height = height or self.background_panel.winfo_height()
-        if width < 2 or height < 2:
-            return
-        from PIL import Image, ImageOps, ImageTk
-
-        if self.background_size != (width, height):
-            image = ImageOps.fit(self.background_source, (width, height),
-                                 method=Image.Resampling.LANCZOS, centering=(0.5, 0.4))
-            image = Image.blend(image, Image.new("RGB", (width, height), "white"), 0.62)
-            self.background_photo = ImageTk.PhotoImage(image, master=self.root)
-            self.background_layer.configure(image=self.background_photo)
-            self.background_layer.lower()
-            self.background_image = image
-            self.background_size = (width, height)
-
-        origin_x = self.background_panel.winfo_rootx()
-        origin_y = self.background_panel.winfo_rooty()
-        for frame, background in self.photo_surfaces:
-            if not frame.winfo_ismapped():
-                continue
-            left = frame.winfo_rootx() - origin_x
-            top = frame.winfo_rooty() - origin_y
-            right = min(left + frame.winfo_width(), width)
-            bottom = min(top + frame.winfo_height(), height)
-            if left < 0 or top < 0 or right <= left or bottom <= top:
-                continue
-            photo = ImageTk.PhotoImage(self.background_image.crop((left, top, right, bottom)),
-                                       master=self.root)
-            background.configure(image=photo)
-            background.lower()
-            self.surface_photos[background] = photo
-
-    def _make_controls_translucent(self):
-        if sys.platform != "win32" or self.background_source is None:
-            return
-        user32 = ctypes.windll.user32
-        translucent_widgets = (tk.Text, tk.Entry, tk.Button, ttk.Treeview, ttk.Entry,
-                               ttk.Button, ttk.Scrollbar)
-        background_layers = {self.background_layer}
-        background_layers.update(background for _, background in self.photo_surfaces)
-
-        def apply(widget):
-            if widget not in background_layers and isinstance(widget, (tk.Label,) + translucent_widgets):
-                handle = widget.winfo_id()
-                style = user32.GetWindowLongW(handle, -20)
-                user32.SetWindowLongW(handle, -20, style | 0x80000)
-                if isinstance(widget, tk.Label):
-                    red, green, blue = (value // 256 for value in widget.winfo_rgb(widget.cget("bg")))
-                    user32.SetLayeredWindowAttributes(handle, red | green << 8 | blue << 16, 0, 0x1)
-                else:
-                    user32.SetLayeredWindowAttributes(handle, 0, 220, 0x2)
-            for child in widget.winfo_children():
-                apply(child)
-
-        apply(self.background_panel)
+    def _window_destroyed(self, event):
+        if event.widget == self.root:
+            # No polling or image-render callbacks should outlive this window.
+            for job in self.root.tk.call("after", "info"):
+                self.root.after_cancel(job)
+            # Release Tk-owned resources on the UI thread, even if a browser
+            # worker is the last owner of the Python panel object.
+            for name, value in tuple(vars(self).items()):
+                if isinstance(value, tk.Variable):
+                    setattr(self, name, None)
 
     def show_api_settings(self):
         try:
@@ -313,57 +234,228 @@ class WindowsControlPanel:
             initial_error = str(exc)
         dialog = tk.Toplevel(self.root)
         dialog.withdraw()
-        dialog.title("语音识别 API 设置")
+        dialog.title("语音识别设置")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         frame = ttk.Frame(dialog, padding=20)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, text="百炼语音识别", font=("Microsoft YaHei UI", 13, "bold")).grid(
+        ttk.Label(frame, text="语音识别", font=("Microsoft YaHei UI", 13, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 5))
         ttk.Label(frame, text="配置仅保存在本机；下次开始监听时生效。",
-                  foreground="#66758C").grid(row=1, column=0, sticky="w", pady=(0, 16))
-        ttk.Label(frame, text="DashScope API Key").grid(row=2, column=0, sticky="w")
+                  foreground="#687586").grid(row=1, column=0, sticky="w", pady=(0, 16))
+        providers = {"本地 SenseVoiceSmall INT8（离线 CPU）": "sensevoice",
+                     "阿里云百炼（联网）": "dashscope"}
+        selected = config.get("voice_provider", DEFAULT_PROVIDER)
+        provider_var = tk.StringVar(value=next(
+            (label for label, value in providers.items() if value == selected),
+            "阿里云百炼（联网）"))
+        provider_box = ttk.Combobox(frame, textvariable=provider_var,
+                                     values=list(providers), state="readonly", width=55)
+        provider_box.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        local_frame = ttk.Frame(frame)
+        local_frame.grid(row=3, column=0, sticky="ew")
+        local_frame.columnconfigure(0, weight=1)
+        ttk.Label(local_frame, text="模型目录（包含 model.int8.onnx 和 tokens.txt）").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        path_var = tk.StringVar(value=config.get("local_model_dir", str(default_local_model_dir())))
+        path_entry = ttk.Entry(local_frame, textvariable=path_var, width=55)
+        path_entry.grid(row=1, column=0, sticky="ew", pady=(5, 12))
+
+        def browse_model():
+            folder = filedialog.askdirectory(parent=dialog, title="选择 SenseVoice 模型目录")
+            if folder:
+                path_var.set(folder)
+
+        browse_button = ttk.Button(local_frame, text="浏览…", command=browse_model)
+        browse_button.grid(row=1, column=1, padx=(8, 0), pady=(5, 12))
+        ttk.Label(local_frame, text="识别语言（auto 自动检测；zh 中文；yue 粤语）").grid(
+            row=2, column=0, columnspan=2, sticky="w")
+        language_var = tk.StringVar(value=config.get("local_language", "auto"))
+        language_box = ttk.Combobox(local_frame, textvariable=language_var, state="readonly",
+                                    values=("auto", "zh", "en", "ja", "ko", "yue"))
+        language_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 12))
+        ttk.Label(local_frame, text="音量门限（dBFS，默认 -42；越低越容易收音）").grid(
+            row=4, column=0, columnspan=2, sticky="w")
+        threshold_var = tk.StringVar(value=str(config.get("local_threshold_db", -42)))
+        threshold_entry = ttk.Spinbox(local_frame, from_=-90, to=-10, textvariable=threshold_var)
+        threshold_entry.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(5, 12))
+        ttk.Label(local_frame, text="直接读取本机模型，无需 API Key，音频不上传。",
+                  foreground="#687586").grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        cloud_frame = ttk.Frame(frame)
+        cloud_frame.grid(row=3, column=0, sticky="ew")
+        cloud_frame.columnconfigure(0, weight=1)
+        ttk.Label(cloud_frame, text="DashScope API Key").grid(row=2, column=0, sticky="w")
         key_var = tk.StringVar(value=config.get("dashscope_api_key", ""))
-        key_entry = ttk.Entry(frame, textvariable=key_var, show="*", width=55)
+        key_entry = ttk.Entry(cloud_frame, textvariable=key_var, show="*", width=55)
         key_entry.grid(row=3, column=0, sticky="ew", pady=(5, 3))
         show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame, text="显示 Key", variable=show_key,
+        ttk.Checkbutton(cloud_frame, text="显示 Key", variable=show_key,
                         command=lambda: key_entry.configure(show="" if show_key.get() else "*")).grid(
                             row=4, column=0, sticky="w", pady=(0, 12))
-        ttk.Label(frame, text="识别模型").grid(row=5, column=0, sticky="w")
+        ttk.Label(cloud_frame, text="识别模型").grid(row=5, column=0, sticky="w")
         model_var = tk.StringVar(value=DEFAULT_MODEL)
-        ttk.Entry(frame, textvariable=model_var, state="readonly").grid(
+        ttk.Entry(cloud_frame, textvariable=model_var, state="readonly").grid(
             row=6, column=0, sticky="ew", pady=(5, 12))
-        ttk.Label(frame, text="WebSocket 地址").grid(row=7, column=0, sticky="w")
+        ttk.Label(cloud_frame, text="WebSocket 地址").grid(row=7, column=0, sticky="w")
         url_var = tk.StringVar(value=config.get("websocket_url", DEFAULT_WS_URL))
-        ttk.Entry(frame, textvariable=url_var).grid(row=8, column=0, sticky="ew", pady=(5, 12))
+        ttk.Entry(cloud_frame, textvariable=url_var).grid(row=8, column=0, sticky="ew", pady=(5, 12))
         if os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("DASHSCOPE_WEBSOCKET_URL"):
-            ttk.Label(frame, text="检测到环境变量；环境变量会优先于窗口配置。",
-                      foreground="#A6661A").grid(row=9, column=0, sticky="w", pady=(0, 8))
+            ttk.Label(cloud_frame, text="检测到环境变量；百炼模式下环境变量会优先于窗口配置。",
+                      foreground="#987339").grid(row=9, column=0, sticky="w", pady=(0, 8))
         error_var = tk.StringVar(value=initial_error)
-        ttk.Label(frame, textvariable=error_var, foreground="#BF4242", wraplength=480).grid(
+        ttk.Label(frame, textvariable=error_var, foreground="#B24C5D", wraplength=480).grid(
             row=10, column=0, sticky="ew")
         buttons = ttk.Frame(frame)
         buttons.grid(row=11, column=0, sticky="e", pady=(16, 0))
 
-        def save():
+        install_frame = ttk.Frame(local_frame)
+        install_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+        install_status = tk.StringVar(value=(
+            f"首次安装联网下载约 {MODEL_BYTES / 1024 / 1024:.1f} MiB；安装后可离线识别。"))
+        install_progress = ttk.Progressbar(local_frame, mode="determinate", maximum=MODEL_BYTES)
+        install_progress.grid(row=8, column=0, columnspan=2, sticky="ew")
+        ttk.Label(local_frame, textvariable=install_status, wraplength=480,
+                  foreground="#687586").grid(row=9, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ttk.Label(local_frame, text="下载源：魔搭优先，失败后自动切换 Hugging Face。",
+                  foreground="#687586").grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        install_events = queue.Queue()
+        install_cancel = threading.Event()
+        installing = False
+        install_timer = None
+        install_options = {}
+
+        def set_installing(value):
+            nonlocal installing
+            installing = value
+            for widget in (path_entry, browse_button, threshold_entry, install_button, save_button):
+                widget.configure(state="disabled" if value else "normal")
+            for widget in (provider_box, language_box):
+                widget.configure(state="disabled" if value else "readonly")
+            cancel_install_button.configure(state="normal" if value else "disabled")
+
+        def poll_install():
+            nonlocal install_timer
+            install_timer = None
             try:
-                save_settings(key_var.get(), url_var.get())
-            except VoiceError as exc:
+                while True:
+                    kind, value = install_events.get_nowait()
+                    if kind == "progress":
+                        done, total, detail = value
+                        install_progress.configure(maximum=total, value=done)
+                        install_status.set(f"{detail}  {done / 1024 / 1024:.1f} / "
+                                           f"{total / 1024 / 1024:.1f} MiB")
+                        continue
+                    set_installing(False)
+                    if kind == "done":
+                        if install_cancel.is_set():
+                            install_status.set("已取消自动配置；下载完成的模型保留在本机。")
+                            continue
+                        path_var.set(str(value))
+                        try:
+                            save_settings(install_options["key"], install_options["url"],
+                                          provider="sensevoice", local_model_dir=str(value),
+                                          local_language=install_options["language"],
+                                          local_threshold_db=install_options["threshold"])
+                        except (VoiceError, OSError) as exc:
+                            install_status.set("模型已安装；请点击“保存配置”重试保存。")
+                            error_var.set(str(exc))
+                        else:
+                            install_status.set("模型已安装并自动保存配置；下次开始监听时生效。")
+                            self._append_log(f"本地语音模型已安装：{value}", "模型")
+                    elif isinstance(value, ModelInstallCancelled):
+                        install_status.set(str(value))
+                    else:
+                        install_status.set("安装失败，可重新点击“一键安装模型”重试。")
+                        error_var.set(str(value))
+            except queue.Empty:
+                pass
+            if installing:
+                install_timer = dialog.after(100, poll_install)
+
+        def start_install():
+            nonlocal install_timer
+            if installing:
+                return
+            try:
+                threshold = float(threshold_var.get())
+                if not -90 <= threshold <= -10:
+                    raise ValueError("音量门限必须在 -90 到 -10 dBFS 之间。")
+            except ValueError as exc:
                 error_var.set(str(exc))
                 return
-            self._append_log("语音 API 配置已保存；下次开始监听时生效。", "配置")
+            install_options.update(key=key_var.get(), url=url_var.get(),
+                                   language=language_var.get(), threshold=threshold)
+            install_cancel.clear()
+            error_var.set("")
+            install_progress.configure(value=0)
+            install_status.set("正在准备安装并校验已有文件…")
+            set_installing(True)
+
+            def worker():
+                try:
+                    folder = install_model(
+                        managed_model_dir(), cancel=install_cancel,
+                        on_progress=lambda *event: install_events.put(("progress", event)))
+                    install_events.put(("done", folder))
+                except Exception as exc:
+                    install_events.put(("error", exc))
+
+            threading.Thread(target=worker, daemon=True).start()
+            install_timer = dialog.after(100, poll_install)
+
+        def cancel_install():
+            install_cancel.set()
+            install_status.set("正在取消下载…")
+            cancel_install_button.configure(state="disabled")
+
+        def dialog_destroyed(event):
+            nonlocal provider_var, path_var, language_var, threshold_var, key_var, url_var
+            nonlocal model_var, show_key, error_var, install_status
+            if event.widget == dialog:
+                install_cancel.set()
+                if install_timer is not None:
+                    dialog.after_cancel(install_timer)
+                # Worker callbacks keep closure cells alive until they finish.
+                # Destroy dialog variables here, on Tk's own thread.
+                provider_var = path_var = language_var = threshold_var = None
+                key_var = url_var = model_var = show_key = error_var = install_status = None
+
+        dialog.bind("<Destroy>", dialog_destroyed, add="+")
+        install_button = ttk.Button(install_frame, text="一键安装模型", command=start_install)
+        install_button.pack(side="left")
+        cancel_install_button = ttk.Button(install_frame, text="取消下载", command=cancel_install,
+                                          state="disabled")
+        cancel_install_button.pack(side="left", padx=(8, 0))
+
+        def save():
+            try:
+                provider = providers[provider_var.get()]
+                save_settings(key_var.get(), url_var.get(), provider=provider,
+                              local_model_dir=path_var.get(), local_language=language_var.get(),
+                              local_threshold_db=float(threshold_var.get()) if provider == "sensevoice" else None)
+            except (VoiceError, ValueError) as exc:
+                error_var.set(str(exc))
+                return
+            self._append_log(f"{provider_var.get()}配置已保存；下次开始监听时生效。", "配置")
             dialog.destroy()
 
+        def update_provider(_event=None):
+            local = providers[provider_var.get()] == "sensevoice"
+            (cloud_frame if local else local_frame).grid_remove()
+            (local_frame if local else cloud_frame).grid()
+
+        provider_box.bind("<<ComboboxSelected>>", update_provider)
+        update_provider()
         ttk.Button(buttons, text="取消", command=dialog.destroy,
                    style="App.TButton").pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="保存配置", command=save,
-                   style="App.TButton").pack(side="left")
+        save_button = ttk.Button(buttons, text="保存配置", command=save, style="App.TButton")
+        save_button.pack(side="left")
         dialog.bind("<Escape>", lambda _: dialog.destroy())
         self._show_dialog(dialog)
-        key_entry.focus_set()
+        provider_box.focus_set()
 
     def show_extension_setup(self):
         from windows_extension_setup import open_extensions_page, prepare_extension
@@ -384,7 +476,7 @@ class WindowsControlPanel:
         ttk.Label(frame, text="连接已打开的直播页面",
                   font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
         ttk.Label(frame, text="扩展已包含在应用中。每个使用的浏览器只需安装一次。",
-                  foreground="#66758C").grid(row=1, column=0, sticky="w", pady=(0, 16))
+                  foreground="#687586").grid(row=1, column=0, sticky="w", pady=(0, 16))
         ttk.Label(frame, text="1. 打开 Edge 或 Chrome 的扩展管理页。\n"
                               "2. 开启“开发者模式”，点击“加载解压缩的扩展程序”。\n"
                               "3. 选择下面的扩展目录，保持扩展启用。",
@@ -392,9 +484,10 @@ class WindowsControlPanel:
         ttk.Label(frame, text="扩展目录").grid(row=3, column=0, sticky="w")
         folder_row = ttk.Frame(frame)
         folder_row.grid(row=4, column=0, sticky="ew", pady=(5, 12))
-        folder_var = tk.StringVar(value=str(folder))
-        ttk.Entry(folder_row, textvariable=folder_var, state="readonly", width=55).pack(
-            side="left", fill="x", expand=True)
+        folder_entry = ttk.Entry(folder_row, width=55)
+        folder_entry.insert(0, str(folder))
+        folder_entry.configure(state="readonly")
+        folder_entry.pack(side="left", fill="x", expand=True)
 
         def copy_folder():
             dialog.clipboard_clear()
@@ -418,10 +511,11 @@ class WindowsControlPanel:
                    style="App.TButton").pack(side="left", padx=(0, 8))
         ttk.Button(browser_row, text="打开 Chrome 扩展页", command=lambda: launch("chrome"),
                    style="App.TButton").pack(side="left")
-        ttk.Label(frame, textvariable=status_var, foreground="#BF4242",
+        ttk.Label(frame, textvariable=status_var, foreground="#B24C5D",
                   wraplength=500).grid(row=6, column=0, sticky="ew", pady=(12, 0))
-        ttk.Label(frame, text="浏览器要求你在扩展页确认安装；完成后应用会自动发现直播间。",
-                  foreground="#66758C").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="选择目录时可能不显示文件，选中上述文件夹即可。\n"
+                              "浏览器要求你在扩展页确认安装；完成后应用会自动发现直播间。",
+                  foreground="#687586").grid(row=7, column=0, sticky="w", pady=(8, 0))
         dialog.bind("<Escape>", lambda _: dialog.destroy())
         self._show_dialog(dialog)
 
@@ -438,33 +532,115 @@ class WindowsControlPanel:
         if room:
             self.selected_room_label.configure(text=f"{room.platform}  ·  房间 {room.room_number}")
             description = (room.title or room.url) if room.ready else (room.reason or "页面尚未准备好发送")
+            if self._auto_mode() and self.auto_hint:
+                description = self.auto_hint + " · " + description
             self.selected_room_hint.configure(
                 text=description[:100] + ("…" if len(description) > 100 else ""))
         else:
-            self.selected_room_label.configure(text="尚未选择直播间")
-            self.selected_room_hint.configure(text="从上方列表中选择一个可发送的直播间")
+            self.selected_room_label.configure(text="自动跟随：等待直播间" if self._auto_mode() else "尚未选择直播间")
+            self.selected_room_hint.configure(text=self.auto_hint if self._auto_mode()
+                                               else "从上方列表中选择一个可发送的直播间")
         if self.listening:
-            self.listen_indicator.configure(text="● 监听中", bg="#E8F7EF", fg="#18835A")
+            self.listen_indicator.configure(text="● 监听中", fg="#347A61")
         elif self.voice:
-            self.listen_indicator.configure(text="● 启动中", bg="#EAF1FF", fg="#2864DC")
+            self.listen_indicator.configure(text="● 启动中", fg="#3B74CD")
+        elif self.auto_listen_requested:
+            self.listen_indicator.configure(text="● 等待直播间", fg="#987339")
         else:
-            self.listen_indicator.configure(text="未监听", bg="#F0F3F7", fg="#66758C")
-        self.listen_button.configure(bg="#BF4242" if self.voice else "#2864DC",
-                                     activebackground="#A93535" if self.voice else "#1E55C2")
+            self.listen_indicator.configure(text="未监听", fg="#687586")
+        running = bool(self.voice or self.auto_listen_requested)
+        self.listen_button.configure(bg="#CC6670" if running else "#3B74CD",
+                                     text="停止监听" if running else "开始监听",
+                                     state="normal" if running or self._auto_mode() or (room and room.ready)
+                                     else "disabled")
+
+    def _auto_mode(self):
+        return hasattr(self, "target_mode") and self.target_mode.get() == "auto"
+
+    def _change_target_mode(self):
+        self.auto_follow_generation += 1
+        if self._auto_mode():
+            self.auto_listen_requested = bool(self.voice or self.auto_listen_requested)
+            if self.voice:
+                self.stop_listening("已启用自动跟随，正在确认当前直播页。", keep_auto=True)
+            self.selected_key = None
+            self.auto_target_identity = None
+            self.auto_hint = "正在识别最近使用的浏览器活动页…"
+            self._sync_table_selection()
+            self._append_log("已启用自动跟随；切换直播页时自动更换目标。", "选择模式")
+            self._request_auto_room()
+        else:
+            self.auto_listen_requested = False
+            self._append_log("已切换为手动选择，当前目标保持不变。", "选择模式")
+        self._update_room_summary()
+
+    def _auto_follow_timer(self):
+        self._request_auto_room()
+        self.root.after(500, self._auto_follow_timer)
+
+    def _request_auto_room(self):
+        if not self._auto_mode() or self.auto_follow_busy:
+            return
+        self.auto_follow_busy = True
+        generation = self.auto_follow_generation
+
+        def worker():
+            try:
+                room, hint = self.browser.viewing_room()
+                self.jobs.put(("auto-room", (generation, room, hint), None))
+            except Exception as exc:
+                self.jobs.put(("auto-room", (generation, None, "读取浏览器活动页失败。"), exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _sync_table_selection(self):
+        self.rendering_rooms = True
+        try:
+            selected = self.table.selection()
+            if selected:
+                self.table.selection_remove(*selected)
+            for index, room in enumerate(self.rooms):
+                if room.key == self.selected_key:
+                    self.table.selection_set(str(index))
+                    self.table.focus(str(index))
+                    self.table.see(str(index))
+                    break
+        finally:
+            self.rendering_rooms = False
+
+    def _apply_auto_room(self, room, hint):
+        identity = (room.key, room.platform, room.room_number) if room else None
+        changed = identity != self.auto_target_identity
+        self.auto_hint = hint
+        if self.voice and (changed or not room or not room.ready):
+            self.stop_listening("自动跟随目标变化或暂不可用；已清空旧目标的待发送语音。", keep_auto=True)
+        self.auto_target_identity = identity
+        self.selected_key = room.key if room else None
+        if room:
+            index = next((i for i, item in enumerate(self.rooms) if item.key == room.key), None)
+            if index is None:
+                self._render_rooms([*self.rooms, room], None)
+            elif self.rooms[index] != room:
+                rooms = list(self.rooms)
+                rooms[index] = room
+                self._render_rooms(rooms, None)
+            if changed:
+                self._append_log(f"已跟随 {room.platform} 房间 {room.room_number}。", "自动选择")
+        elif changed:
+            self._append_log(hint, "自动跟随暂停")
+        if changed:
+            self._sync_table_selection()
+        if self.auto_listen_requested and room and room.ready and not self.voice:
+            self.start_listening()
+        self._update_room_summary()
 
     def _append_log(self, text, category="信息"):
         stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         line = f"[{stamp}] {category}：{str(text).strip()}\n"
-        self.detail.configure(state="normal")
         tag = ("error" if "失败" in category or "未发送" in category else
                "success" if "已触发" in category else
                "recognized" if category == "识别" else "")
-        self.detail.insert("end", line, tag)
-        lines = int(self.detail.index("end-1c").split(".")[0])
-        if lines > 1000:
-            self.detail.delete("1.0", f"{lines - 1000}.0")
-        self.detail.see("end")
-        self.detail.configure(state="disabled")
+        self.detail.append(line, tag)
 
     def _scan_notice(self, text):
         if text != self.last_scan_notice:
@@ -500,7 +676,7 @@ class WindowsControlPanel:
         self.refreshing = False
         self.rooms = rooms
         selected = self.selected_key
-        if self.listening:
+        if self.listening and not self._auto_mode():
             if any(room.key == self.listening_target_key and room.ready for room in rooms):
                 self.target_missing_since = None
             elif self.target_missing_since is None:
@@ -548,10 +724,12 @@ class WindowsControlPanel:
         self._update_room_summary()
 
     def _select_room(self, _event=None):
-        if self.rendering_rooms:
+        if self.rendering_rooms or self._auto_mode():
             return
         selection = self.table.selection()
         if not selection:
+            if self._auto_mode():
+                return
             self.selected_key = None
             self.listen_button.configure(state="normal" if self.voice else "disabled")
             self._update_room_summary()
@@ -565,7 +743,7 @@ class WindowsControlPanel:
             return
         self.selected_key = room.key
         self.listen_button.configure(state="normal" if room.ready or self.voice else "disabled")
-        if self.listening and self.listening_target_key != room.key and previous_key != room.key:
+        if self.voice and self.listening_target_key != room.key and previous_key != room.key:
             self.stop_listening("已切换直播间，已停止原目标的语音监听。")
         self._update_room_summary()
         self._append_log(
@@ -573,12 +751,31 @@ class WindowsControlPanel:
             f"{'可发送' if room.ready else room.reason or '暂不可发送'}"
         )
 
+    def _manual_room_choice(self, _event=None):
+        if self.rendering_rooms:
+            return
+        selection = self.table.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self.rooms) or self.rooms[index].key == self.selected_key:
+            return
+        if self._auto_mode():
+            self.target_mode.set("manual")
+            self._change_target_mode()
+        self._select_room()
+
     def _drain_jobs(self):
         try:
             while True:
                 kind, value, error = self.jobs.get_nowait()
                 if kind == "rooms":
                     self._render_rooms(value, error)
+                elif kind == "auto-room":
+                    self.auto_follow_busy = False
+                    generation, room, hint = value
+                    if self._auto_mode() and generation == self.auto_follow_generation:
+                        self._apply_auto_room(room, str(error) if error else hint)
                 elif kind == "send":
                     message, result = value
                     self._finish_send(message, result, error)
@@ -628,10 +825,12 @@ class WindowsControlPanel:
             return
         self.send_button.configure(state="disabled")
         self._append_log(message, "手动发送中")
+        follow_active = self._auto_mode()
 
         def worker():
             try:
-                result = self.browser.send(room, message)
+                result = (self.browser.send(room, message, follow_active=True) if follow_active
+                          else self.browser.send(room, message))
                 self.jobs.put(("send", (message, result), None))
             except Exception as exc:
                 self.jobs.put(("send", (message, None), exc))
@@ -639,14 +838,14 @@ class WindowsControlPanel:
         threading.Thread(target=worker, daemon=True).start()
 
     def toggle_listening(self):
-        if self.voice:
+        if self.voice or self.auto_listen_requested:
             self.stop_listening()
         else:
             self.start_listening()
 
     def start_listening(self):
         room = self._selected()
-        if not room or not room.ready:
+        if (not room or not room.ready) and not self._auto_mode():
             self._append_log("请先选择一个可发送的直播间。")
             return
         try:
@@ -657,6 +856,12 @@ class WindowsControlPanel:
             self._append_log("发送间隔必须是大于或等于 0 的数字。")
             return
         self.interval = interval
+        if self._auto_mode():
+            self.auto_listen_requested = True
+            if not room or not room.ready:
+                self.status.configure(text="自动监听：等待可发送的活动直播页…")
+                self._update_room_summary()
+                return
         self.stop_voice = threading.Event()
         self.voice_session += 1
         session = self.voice_session
@@ -688,6 +893,8 @@ class WindowsControlPanel:
             except Exception as exc:
                 if not stop_event.is_set():
                     self.jobs.put(("voice-start", (session, None), exc))
+            finally:
+                voice.close()
 
         self.voice_thread = threading.Thread(target=worker, daemon=True)
         self.voice_thread.start()
@@ -699,7 +906,7 @@ class WindowsControlPanel:
         self.listening = True
         self.status.configure(text="监听中")
         self._update_room_summary()
-        self._append_log("语音监听已启动，等待识别完整句子。", "监听")
+        self._append_log(f"{self.voice.backend_label}已启动，等待识别完整句子。", "监听")
 
     def _send_voice_sentence(self, sentence):
         if not self.listening:
@@ -708,6 +915,14 @@ class WindowsControlPanel:
         if not sentence:
             return
         self._append_log(sentence, "识别")
+        if self._auto_mode():
+            current, _ = self.browser.viewing_room(refresh_native=False)
+            selected = self._selected()
+            if (not current or not selected or (current.key, current.room_number)
+                    != (selected.key, selected.room_number)):
+                self._append_log(sentence, "未发送（活动直播页已变化）")
+                self._request_auto_room()
+                return
         if len(self.voice_pending) >= MAX_VOICE_QUEUE:
             self._append_log(sentence, "未发送（等待队列已满）")
             return
@@ -740,10 +955,12 @@ class WindowsControlPanel:
         self.last_sent = time.monotonic()
         session = self.voice_session
         self._append_log(message, "语音发送中")
+        follow_active = self._auto_mode()
 
         def worker():
             try:
-                result = self.browser.send(room, message)
+                result = (self.browser.send(room, message, follow_active=True) if follow_active
+                          else self.browser.send(room, message))
                 self.jobs.put(("voice-send", (session, message, result), None))
             except Exception as exc:
                 self.jobs.put(("voice-send", (session, message, None), exc))
@@ -763,9 +980,11 @@ class WindowsControlPanel:
             self._append_log(f"{message}；{json_message(result)}", "语音网页发送已触发")
         self._pump_voice_send()
 
-    def stop_listening(self, reason=""):
+    def stop_listening(self, reason="", *, keep_auto=False):
         was_listening = self.voice is not None
         self.stop_voice.set()
+        if not keep_auto:
+            self.auto_listen_requested = False
         self.voice_session += 1
         if self.voice:
             self.voice.close()
@@ -807,6 +1026,14 @@ def json_message(result):
 
 
 def main():
+    if "--self-check" in sys.argv:
+        import argparse
+        from portable_check import run_check
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--self-check", required=True)
+        parser.add_argument("--self-check-audio")
+        options = parser.parse_args()
+        raise SystemExit(run_check(options.self_check, options.self_check_audio))
     if sys.platform == "win32":
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     root = tk.Tk()

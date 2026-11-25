@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 PORT = 8765
 MAX_BODY = 1_000_000
 SNAPSHOT_TIMEOUT = 90
+VIEW_TIMEOUT = 4
 COMMAND_WAIT_SECONDS = 5
 
 
@@ -37,6 +38,7 @@ class ExtensionBridge:
         self.lock = threading.Lock()
         self.command_ready = threading.Condition(self.lock)
         self.snapshots = {}
+        self.views = {}
         self.commands = {}
         self.pending = {}
         self.next_id = 0
@@ -115,6 +117,9 @@ class ExtensionBridge:
                 if self.path == "/snapshot":
                     bridge.publish(data)
                     self._write({"ok": True})
+                elif self.path == "/view":
+                    bridge.publish_view(data)
+                    self._write({"ok": True, "current": bridge.current_view()})
                 elif self.path == "/result":
                     bridge.complete(data)
                     self._write({"ok": True})
@@ -161,6 +166,36 @@ class ExtensionBridge:
         self.tabs()
         with self.lock:
             return bool(self.snapshots)
+
+    def publish_view(self, data):
+        client_id, tab_id = data.get("clientId"), data.get("tabId")
+        active_at = data.get("lastActiveAt")
+        if (not isinstance(client_id, str) or not client_id or len(client_id) > 120
+                or type(tab_id) is not int or type(active_at) not in (int, float)
+                or not 0 <= active_at <= time.time() * 1000 + 5000):
+            return
+        url = data.get("url", "")
+        if not isinstance(url, str):
+            return
+        platform, _ = self.supported_platform(url)
+        with self.lock:
+            self.views[client_id] = (time.monotonic(), {
+                "clientId": client_id, "tabId": tab_id, "lastActiveAt": active_at,
+                "url": url if platform else "",
+                "title": str(data.get("title", ""))[:300] if platform else "",
+            })
+
+    def current_view(self):
+        now = time.monotonic()
+        with self.lock:
+            if not self.views:
+                return None
+            if len(self.views) > 1 and not any(view["lastActiveAt"] for _, view in self.views.values()):
+                return None
+            # Consider the most recently used browser first. If it disconnects, pause
+            # instead of falling back to a live page left open in another browser.
+            seen, view = max(self.views.values(), key=lambda item: item[1]["lastActiveAt"])
+            return dict(view) if now - seen <= VIEW_TIMEOUT else None
 
     def complete(self, data):
         request_id = data.get("requestId")

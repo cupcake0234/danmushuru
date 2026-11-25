@@ -1,4 +1,9 @@
 {
+  "voice_provider": "sensevoice",
+  "local_model_dir": "models/sensevoice-small-int8-2024-07-17",
+  "local_language": "auto",
+  "local_num_threads": 2,
+  "local_threshold_db": -42,
   "dashscope_api_key": "",
   "model": "paraformer-realtime-v2",
   "websocket_url": "wss://dashscope.aliyuncs.com/api-ws/v1/inference"

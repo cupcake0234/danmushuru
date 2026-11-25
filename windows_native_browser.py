@@ -91,9 +91,7 @@ def _inside_document(control):
 
 def _address(window):
     candidates = []
-    for item in _controls(window):
-        if _property(item, "control_type") != "Edit":
-            continue
+    for item in window.descendants(control_type="Edit"):
         identity = (_name(item) + " " + _property(item, "automation_id")).lower()
         if "omnibox" in identity or "address" in identity or "地址" in identity or "搜索栏" in identity:
             candidates.append(item)
@@ -185,6 +183,38 @@ def _process_name(pid):
         kernel32.CloseHandle(handle)
 
 
+def frontmost_browser_window():
+    """Read Z order only: the front browser stays first when the panel takes focus."""
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetTopWindow.argtypes = [wintypes.HWND]
+    user32.GetTopWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    handle = user32.GetTopWindow(None)
+    seen = set()
+    while handle and handle not in seen:
+        seen.add(handle)
+        if user32.IsWindowVisible(handle) and not user32.IsIconic(handle):
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(handle, class_name, len(class_name))
+            if class_name.value == "Chrome_WidgetWin_1":
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+                if _process_name(pid.value) in BROWSER_NAMES:
+                    title = ctypes.create_unicode_buffer(1024)
+                    user32.GetWindowTextW(handle, title, len(title))
+                    return int(handle), title.value
+        handle = user32.GetWindow(handle, 2)  # GW_HWNDNEXT, never activate/select.
+    return None
+
+
 class NativeWindowsBrowser:
     def __init__(self):
         if sys.platform != "win32":
@@ -214,6 +244,18 @@ class NativeWindowsBrowser:
             if window.handle == handle:
                 return window
         raise NativeBrowserError("浏览器窗口已关闭")
+
+    def active_tab(self, handle, supported_platform):
+        window = self.desktop.window(handle=handle).wrapper_object()
+        url = _address(window)
+        platform, room = supported_platform(url)
+        if not platform:
+            return None
+        tab = next((tab for tab in self._tabs(window) if _selected(tab)), None)
+        if tab is None:
+            raise NativeBrowserError("浏览器没有提供活动标签页信息")
+        return NativeTab(handle, _tab_id(tab), "", url, _name(tab), platform, room,
+                         False, "等待直播页状态更新")
 
     def discover(self, supported_platform):
         result = []

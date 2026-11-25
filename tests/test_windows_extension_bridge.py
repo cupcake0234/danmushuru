@@ -62,6 +62,37 @@ class ExtensionBridgeTests(unittest.TestCase):
             self.request("/commands?clientId=unknown", origin=False)
         self.assertEqual(caught.exception.code, 403)
 
+    def view(self, client, tab, url, active_at):
+        return self.request("/view", {"clientId": client, "tabId": tab,
+                                     "url": url, "title": "直播", "lastActiveAt": active_at})
+
+    def test_latest_browser_wins_even_when_its_active_tab_is_not_live(self):
+        self.view("edge", 1, "https://live.bilibili.com/123", 100)
+        self.view("chrome", 2, "https://example.com/private", 200)
+        self.assertEqual(self.bridge.current_view()["clientId"], "chrome")
+        self.assertEqual(self.bridge.current_view()["url"], "")
+        self.assertEqual(self.bridge.current_view()["title"], "")
+
+    def test_background_heartbeat_does_not_override_recent_browser(self):
+        self.view("edge", 1, "https://live.bilibili.com/123", 200)
+        self.view("chrome", 2, "https://www.douyu.com/456", 100)
+        self.assertEqual(self.bridge.current_view()["clientId"], "edge")
+        self.view("chrome", 2, "https://www.douyu.com/456", 300)
+        self.assertEqual(self.bridge.current_view()["clientId"], "chrome")
+
+    def test_lost_latest_browser_does_not_fall_back_to_old_room(self):
+        self.view("edge", 1, "https://live.bilibili.com/123", 200)
+        self.view("chrome", 2, "https://www.douyu.com/456", 100)
+        with self.bridge.lock:
+            _, view = self.bridge.views["edge"]
+            self.bridge.views["edge"] = (time.monotonic() - 10, view)
+        self.assertIsNone(self.bridge.current_view())
+
+    def test_view_endpoint_rejects_web_page_origin(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/view", {"clientId": "page"}, origin=False)
+        self.assertEqual(caught.exception.code, 403)
+
     def test_waiting_extension_receives_new_command_immediately(self):
         received = []
         poller = threading.Thread(target=lambda: received.extend(

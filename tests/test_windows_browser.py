@@ -1,12 +1,122 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from windows_browser import BrowserTarget, WindowsBrowser, supported_platform
+from windows_browser import BrowserControlError, BrowserTarget, WindowsBrowser, supported_platform
 
 
 class WindowsBrowserTests(unittest.TestCase):
+    def make_old_extension(self):
+        browser = WindowsBrowser(ports=[])
+        tabs = [SimpleNamespace(client_id="edge", tab_id=7, platform="bilibili", room_number="123",
+                                url="https://live.bilibili.com/123", title="直播甲", ready=True, reason=""),
+                SimpleNamespace(client_id="edge", tab_id=8, platform="douyu", room_number="456",
+                                url="https://www.douyu.com/456", title="直播乙", ready=True, reason="")]
+        browser.extension_bridge = SimpleNamespace(current_view=lambda: None, tabs=lambda: tabs,
+                                                   execute=Mock(return_value={"ok": True, "state": "done"}))
+        return browser, tabs
+
+    def test_old_extension_follows_browser_window_title_without_focus_reports(self):
+        browser, _ = self.make_old_extension()
+        with patch("windows_browser.os.name", "nt"), patch(
+            "windows_native_browser.frontmost_browser_window", return_value=(123, "直播甲 - Microsoft Edge")
+        ) as front, patch("windows_native_browser.NativeWindowsBrowser") as native:
+            first, _ = browser.viewing_room()
+            front.return_value = (123, "直播乙 - Microsoft Edge")
+            second, _ = browser.viewing_room()
+        self.assertEqual((first.room_number, second.room_number), ("123", "456"))
+        native.assert_not_called()
+
+    def test_edge_grouped_window_titles_and_profile_suffix_are_supported(self):
+        browser, _ = self.make_old_extension()
+        with patch("windows_browser.os.name", "nt"), patch(
+            "windows_native_browser.frontmost_browser_window",
+            return_value=(123, "直播甲 和另外 17 个页面 - 个人 - Microsoft\u200b Edge")
+        ), patch("windows_native_browser.NativeWindowsBrowser") as native:
+            target, _ = browser.viewing_room()
+        self.assertEqual(target.room_number, "123")
+        native.assert_not_called()
+
+    def test_fallback_can_send_through_old_extension_without_new_focus_guard(self):
+        browser, _ = self.make_old_extension()
+        with patch("windows_browser.os.name", "nt"), patch(
+            "windows_native_browser.frontmost_browser_window", return_value=(123, "直播甲 - Microsoft Edge")
+        ):
+            target, _ = browser.viewing_room()
+            browser.send(target, "测试", follow_active=True)
+        self.assertFalse(browser.extension_bridge.execute.call_args.args[3]["followActive"])
+
+    def test_fast_fallback_does_not_keep_old_room_after_title_changes(self):
+        browser, _ = self.make_old_extension()
+        with patch("windows_browser.os.name", "nt"), patch(
+            "windows_native_browser.frontmost_browser_window", return_value=(123, "直播甲 - Microsoft Edge")
+        ) as front:
+            target, _ = browser.viewing_room()
+            self.assertEqual(browser.viewing_room(refresh_native=False)[0], target)
+            front.return_value = (123, "其他页面 - Microsoft Edge")
+            self.assertIsNone(browser.viewing_room(refresh_native=False)[0])
+
+    def test_ambiguous_same_room_tabs_are_not_guessed(self):
+        browser, tabs = self.make_old_extension()
+        tabs.append(SimpleNamespace(**{**vars(tabs[0]), "tab_id": 9}))
+        with patch("windows_browser.os.name", "nt"), patch(
+            "windows_native_browser.frontmost_browser_window", return_value=(123, "直播甲 - Microsoft Edge")
+        ), patch("windows_native_browser.NativeWindowsBrowser") as native:
+            native.return_value.active_tab.return_value = SimpleNamespace(
+                platform="bilibili", room_number="123", window_handle=123)
+            target, hint = browser.viewing_room()
+        self.assertIsNone(target)
+        self.assertIn("多个标签页", hint)
+
+    def test_fallback_pauses_on_non_live_active_page(self):
+        browser, _ = self.make_old_extension()
+        with patch("windows_browser.os.name", "nt"), patch(
+            "windows_native_browser.frontmost_browser_window", return_value=(123, "其他页面 - Microsoft Edge")
+        ), patch("windows_native_browser.NativeWindowsBrowser") as native:
+            native.return_value.active_tab.return_value = None
+            target, hint = browser.viewing_room()
+        self.assertIsNone(target)
+        self.assertIn("不是直播间", hint)
+
+    def make_viewing_browser(self, *, snapshot_url=None):
+        browser = WindowsBrowser(ports=[])
+        view = {"clientId": "edge", "tabId": 7, "url": "https://live.bilibili.com/123", "title": "正在看的直播"}
+        tab = SimpleNamespace(client_id="edge", tab_id=7, url=snapshot_url or view["url"],
+                              ready=True, reason="")
+        browser.extension_bridge = SimpleNamespace(current_view=lambda: view, tabs=lambda: [tab], execute=Mock(
+            return_value={"ok": True, "state": "done"}))
+        return browser, view
+
+    def test_viewing_room_uses_exact_profile_and_tab(self):
+        browser, _ = self.make_viewing_browser()
+        target, hint = browser.viewing_room()
+        self.assertEqual((target.client_id, target.tab_id, target.room_number), ("edge", "7", "123"))
+        self.assertTrue(target.ready)
+
+    def test_same_tab_navigation_does_not_reuse_old_ready_state(self):
+        browser, _ = self.make_viewing_browser(snapshot_url="https://live.bilibili.com/999")
+        target, _ = browser.viewing_room()
+        self.assertEqual(target.room_number, "123")
+        self.assertFalse(target.ready)
+
+    def test_auto_send_has_extension_guard_and_rejects_changed_view(self):
+        browser, view = self.make_viewing_browser()
+        target, _ = browser.viewing_room()
+        browser.send(target, "测试", follow_active=True)
+        payload = browser.extension_bridge.execute.call_args.args[3]
+        self.assertTrue(payload["followActive"])
+        view["tabId"] = 8
+        with self.assertRaisesRegex(BrowserControlError, "活动直播页已变化"):
+            browser.send(target, "测试", follow_active=True)
+        self.assertEqual(browser.extension_bridge.execute.call_count, 1)
+
+    def test_no_extension_does_not_guess_an_auto_target(self):
+        browser = WindowsBrowser(ports=[])
+        target, hint = browser.viewing_room()
+        self.assertIsNone(target)
+        self.assertIn("扩展", hint)
+
     def test_extension_lists_background_room_and_sends_without_tab_selection(self):
         browser = WindowsBrowser(ports=[])
         tab = SimpleNamespace(client_id="profile", tab_id=7,
